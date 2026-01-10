@@ -3,6 +3,7 @@ use crate::media_server::start_media_server;
 use local_ip_address::local_ip;
 use std::path::Path;
 use tokio::time::{Duration, sleep};
+use warp::Filter;
 
 mod dlna_controller;
 mod media_server;
@@ -13,15 +14,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 启动媒体服务器 - 使用spawn_blocking避免Send trait问题
     let server_port = 8080;
-    let server_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = start_media_server("0.0.0.0", server_port, "./test_videos").await {
-                eprintln!("媒体服务器启动失败: {}", e);
-            }
-        });
-    });
+    // 使用warp提供临时的HTTP服务用于调试
+    
+    let route = warp::path("test_videos")
+    .and(warp::path("12.mp4"))
+    .and(warp::fs::file("test_videos/12.mp4"))
+    .boxed();
 
+
+    let server_handle = tokio::spawn(async move {
+        // route 已经被 move 进来了
+        warp::serve(route)
+            .run(([0, 0, 0, 0], server_port))
+            .await;
+    });
+    
     // 等待服务器启动
     sleep(Duration::from_secs(2)).await;
 

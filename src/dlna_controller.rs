@@ -134,10 +134,15 @@ impl DlnaController {
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "Play";
-        let args_str = "InstanceID=0&Speed=1";
+        let args_str = r#"
+            <InstanceID>0</InstanceID>
+            <Speed>1</Speed>
+            "#;
 
         let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let response = avtransport
+            .action(device_url, action, &args_str)
+            .await?;
         println!("Play响应: {:?}", response);
 
         Ok(())
@@ -150,7 +155,7 @@ impl DlnaController {
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "Pause";
-        let args_str = "InstanceID=0";
+        let args_str = "<InstanceID>0</InstanceID>";
 
         let device_url = device.device.url();
         let response = avtransport.action(device_url, action, &args_str).await?;
@@ -166,7 +171,7 @@ impl DlnaController {
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "Stop";
-        let args_str = "InstanceID=0";
+        let args_str = "<InstanceID>0</InstanceID>";
 
         let device_url = device.device.url();
         let response = avtransport.action(device_url, action, &args_str).await?;
@@ -185,7 +190,7 @@ impl DlnaController {
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "GetTransportInfo";
-        let args_str = "InstanceID=0";
+        let args_str = "<InstanceID>0</InstanceID>";
 
         let device_url = device.device.url();
         let response = avtransport.action(device_url, action, &args_str).await?;
@@ -204,7 +209,7 @@ impl DlnaController {
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "GetPositionInfo";
-        let args_str = "InstanceID=0";
+        let args_str = "<InstanceID>0</InstanceID>";
 
         let device_url = device.device.url();
         let response = avtransport.action(device_url, action, &args_str).await?;
