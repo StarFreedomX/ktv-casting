@@ -3,10 +3,16 @@ use crate::media_server::start_media_server;
 use local_ip_address::local_ip;
 use std::path::Path;
 use tokio::time::{Duration, sleep};
-use warp::Filter;
+// use warp::Filter;
+use actix_web::{get, web, App, HttpServer, HttpResponse, Error};
+use futures_util::StreamExt;
+use reqwest::Client;
 
 mod dlna_controller;
 mod media_server;
+mod bilibili_parser;
+
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,17 +22,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_port = 8080;
     // 使用warp提供临时的HTTP服务用于调试
     
-    let route = warp::path("test_videos")
-    .and(warp::path("12.mp4"))
-    .and(warp::fs::file("test_videos/12.mp4"))
-    .boxed();
+    // let route = warp::path("test_videos")
+    // .and(warp::path("12.mp4"))
+    // .and(warp::fs::file("test_videos/12.mp4"))
+    // .boxed();
 
 
-    let server_handle = tokio::spawn(async move {
-        // route 已经被 move 进来了
-        warp::serve(route)
-            .run(([0, 0, 0, 0], server_port))
-            .await;
+    // let server_handle = tokio::spawn(async move {
+    //     // route 已经被 move 进来了
+    //     warp::serve(route)
+    //         .run(([0, 0, 0, 0], server_port))
+    //         .await;
+    // });
+
+    let client = Client::builder() // 强制使用 rustls
+        .tls_backend_rustls() // 强制使用 rustls
+        .build()
+        .expect("Failed to create client");
+
+    let client_data = web::Data::new(client);
+
+    let server_handle = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        rt.block_on(async {
+            match HttpServer::new(move || {
+                App::new()
+                    .app_data(client_data.clone())
+                    .service(proxy_handler)
+            })
+            .bind(("0.0.0.0", server_port)) {
+                Ok(server) => {
+                    if let Err(e) = server.run().await {
+                        eprintln!("服务器运行错误: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("服务器绑定失败: {}", e),
+            }
+        })
     });
     
     // 等待服务器启动
@@ -138,4 +170,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("应用已退出");
     Ok(())
+}
+
+#[get("/{url:.*}")]
+async fn proxy_handler(
+    path: web::Path<(String,)>,
+    client: web::Data<reqwest::Client>, // 明确指向 reqwest
+) -> Result<HttpResponse, actix_web::Error> {
+    let (url_path,) = path.into_inner();
+    let target_url = bilibili_parser::get_bilibili_direct_link("BV1LS4MzKE8y", Some(1)).await.unwrap();
+
+    let response = client
+        .get(&target_url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+        .send()
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
+    // 解决图 4：中转状态码，避开 http 库版本冲突
+    let status_u16 = response.status().as_u16();
+    let mut client_resp = HttpResponse::build(
+        actix_web::http::StatusCode::from_u16(status_u16)
+            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR)
+    );
+
+    // 解决图 2：中转 Header
+    for (name, value) in response.headers().iter() {
+        let name_str = name.as_str();
+        if name_str != "connection" && name_str != "content-encoding" && name_str != "transfer-encoding" {
+            client_resp.insert_header((name_str, value.as_bytes()));
+        }
+    }
+
+    // 解决图 1 & 3：流式转换
+    let body_stream = response.bytes_stream().map(|item| {
+        item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+
+    Ok(client_resp.streaming(body_stream))
 }
