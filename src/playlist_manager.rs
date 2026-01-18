@@ -1,6 +1,5 @@
 use reqwest::Client;
 use serde_json::json;
-use std::clone;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
@@ -67,7 +66,7 @@ impl PlaylistManager {
         // 获取新的 hash 值
         let new_hash = resp_json["hash"]
             .as_str()
-            .unwrap_or_else(|| "EMPTY_LIST_HASH")
+            .unwrap_or("EMPTY_LIST_HASH")
             .to_string();
 
         let extract_bv_function = |url: &str| {
@@ -86,7 +85,7 @@ impl PlaylistManager {
                 .iter()
                 .filter(|item| {
                     item.get("state")
-                        .map_or(true, |s| s.as_str().unwrap_or("") != "sung")
+                        .is_none_or(|s| s.as_str().unwrap_or("") != "sung")
                 })
                 .filter_map(|item| item["url"].as_str())
                 .map(extract_bv_function)
@@ -101,7 +100,7 @@ impl PlaylistManager {
                 .iter()
                 .find(|item| {
                     item.get("state")
-                        .map_or(false, |s| s.as_str().unwrap_or("") == "sung")
+                        .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
                 })
                 .and_then(|item| item["url"].as_str())   // 把 &str 转为 Option<&str>
                 .map(extract_bv_function)                 // 如果你需要把 url 处理成 bv 等

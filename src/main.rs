@@ -51,7 +51,6 @@ async fn main() -> Result<()> {
     playlist_manager.start_periodic_update(move |url| {
         let controller = controller.clone();
         let device = device.clone();
-        let local_ip = local_ip.clone();
         Box::pin(async move {
             controller.set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
                 .await.unwrap();
@@ -114,7 +113,7 @@ async fn proxy_handler(
     }
 
     let body_stream = response.bytes_stream().map(|item| {
-        item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        item.map_err(|e| std::io::Error::other(e))
     });
 
     Ok(client_resp.streaming(body_stream))
