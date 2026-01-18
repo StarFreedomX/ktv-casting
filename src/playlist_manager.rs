@@ -1,27 +1,31 @@
 use reqwest::Client;
 use serde_json::json;
+use std::clone;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
+use std::pin::Pin;
 #[derive(Clone)]
 pub struct PlaylistManager {
     url: String,
     room_id: u64,
     hash: Arc<Mutex<Option<String>>>,
     playlist: Arc<Mutex<Vec<String>>>,
+    song_playing: Arc<Mutex<Option<String>>>
 }
 
 impl PlaylistManager {
-    pub fn new(url: String, room_id: u64, playlist: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(url: &str, room_id: u64, playlist: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
-            url,
+            url:url.to_string(),
             room_id,
             hash: Arc::new(Mutex::new(None)),
             playlist,
+            song_playing: Arc::new(Mutex::new(None))
         }
     }
 
-    pub async fn fetch_playlist(&mut self) -> Result<(), String> {
+    async fn fetch_playlist(&mut self) -> Result<Option<String>, String> {
         let client = Client::builder()
             .tls_backend_rustls()
             .build()
@@ -57,7 +61,7 @@ impl PlaylistManager {
 
         if !changed {
             println!("播放列表未改变，跳过更新");
-            return Ok(());
+            return Ok(self.song_playing.lock().await.clone());
         }
 
         // 获取新的 hash 值
@@ -66,7 +70,17 @@ impl PlaylistManager {
             .unwrap_or_else(|| "EMPTY_LIST_HASH")
             .to_string();
 
-        // 从 list 数组中提取所有 URL
+        let extract_bv_function = |url: &str| {
+                    // 提取 bilibili://video/ 后面的部分
+                    if let Some(start) = url.find("bilibili://video/") {
+                        let after_prefix = &url[start + "bilibili://video/".len()..];
+                        after_prefix.to_string()
+                    } else {
+                        url.to_string()
+                    }
+            };
+
+        // 从 list 数组中提取待播歌单 URL
         let urls: Vec<String> = if let Some(list_array) = resp_json["list"].as_array() {
             list_array
                 .iter()
@@ -75,19 +89,26 @@ impl PlaylistManager {
                         .map_or(true, |s| s.as_str().unwrap_or("") != "sung")
                 })
                 .filter_map(|item| item["url"].as_str())
-                .map(|url| {
-                    // 提取 bilibili://video/ 后面的部分
-                    if let Some(start) = url.find("bilibili://video/") {
-                        let after_prefix = &url[start + "bilibili://video/".len()..];
-                        after_prefix.to_string()
-                    } else {
-                        url.to_string()
-                    }
-                })
+                .map(extract_bv_function)
                 .collect()
         } else {
             Vec::new()
         };
+
+        // 从 list 数组中提取第一条状态为 “sung” 的歌单 URL
+        let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
+            list_array
+                .iter()
+                .find(|item| {
+                    item.get("state")
+                        .map_or(false, |s| s.as_str().unwrap_or("") == "sung")
+                })
+                .and_then(|item| item["url"].as_str())   // 把 &str 转为 Option<&str>
+                .map(extract_bv_function)                 // 如果你需要把 url 处理成 bv 等
+        } else {
+            None
+        };
+
 
         println!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
 
@@ -102,26 +123,71 @@ impl PlaylistManager {
         playlist.extend(urls);
         drop(playlist); // 释放锁，避免长时间持有
 
+        // 更新当前歌曲
+        let mut song_playing = self.song_playing.lock().await;
+        *song_playing = sung_url.clone();
+        drop(song_playing);
+
+
         // 更新 hash 值
         let mut hash = self.hash.lock().await;
         *hash = Some(new_hash);
         drop(hash); // 释放锁
 
-        Ok(())
+        Ok(sung_url)
     }
 
-    pub fn start_periodic_update(&self) {
-        let mut self_clone = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if let Err(e) = self_clone.fetch_playlist().await {
-                    eprintln!("定时更新播放列表失败: {}", e);
-                }
+    // pub fn start_periodic_update(&self, f_on_update: impl AsyncFn(&str)->() + Send + 'static) {
+    //     let mut self_clone = self.clone();
+    //     tokio::spawn(async move {
+    //         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    //         let mut song_playing: Option<String> = None;
+    //         loop {
+    //             interval.tick().await;
+    //             match self_clone.fetch_playlist().await {
+    //                 Err(e)=>eprintln!("定时更新播放列表失败: {}", e),
+    //                 Ok(song_playing_new)=>{
+    //                     if song_playing_new != song_playing {
+                            
+    //                         if let Some(ref url)=song_playing_new {
+    //                             f_on_update(url);
+    //                         }
+    //                         song_playing = song_playing_new;
+    //                     }
+    //                 },
+    //             }
+    //         }
+    //     });
+    // }
+    // PlaylistManager
+// PlaylistManager
+pub fn start_periodic_update<F>(&self, f_on_update: F)
+where
+    F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+{
+    let mut self_clone = self.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+        let mut song_playing: Option<String> = None;
+        loop {
+            interval.tick().await;
+            match self_clone.fetch_playlist().await {
+                Err(e) => eprintln!("定时更新播放列表失败: {}", e),
+                Ok(song_playing_new) => {
+                    if song_playing_new != song_playing {
+                        if let Some(url) = song_playing_new.clone() {
+                            f_on_update(url).await;   // await the future
+                        }
+                        song_playing = song_playing_new;
+                    }
+                },
             }
-        });
-    }
+        }
+    });
+}
+
+
+
 
     pub async fn next_song(&mut self) -> Result<(), String> {
         let url = format!("{}/api/nextSong?roomId={}", self.url, self.room_id);
@@ -149,7 +215,7 @@ impl PlaylistManager {
         if !resp_json["success"].as_bool().unwrap_or(false) {
             return Err(format!("请求失败: {}", resp_json));
         }
-        self.fetch_playlist().await?;
+        // self.fetch_playlist().await?;
 
         Ok(())
     }
@@ -162,7 +228,7 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     let playlist = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let mut manager = PlaylistManager::new(
-        "http://localhost:5823".to_string(), 
+        "http://localhost:5823", 
         0, 
         playlist.clone(),
     );
@@ -198,7 +264,7 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     } // <--- 锁在这里被强制释放 (DROP)
 
     // --- 后台任务开始 ---
-    manager.start_periodic_update();
+    // manager.start_periodic_update(|url:&str| println!("Song singing changed to {}!",url));
 
     
     // 【关键点 3】：sleep 必须在“裸奔”状态下运行（不持有任何锁）

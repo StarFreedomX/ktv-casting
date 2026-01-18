@@ -1,15 +1,13 @@
 use crate::dlna_controller::DlnaController;
 use crate::bilibili_parser::get_bilibili_direct_link;
 use local_ip_address::local_ip;
-use std::path::Path;
-use tokio::time::{Duration, sleep};
 use actix_web::{get, web, App, HttpServer, HttpResponse};
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use playlist_manager::PlaylistManager;
-use media_server::UrlCache;
+use anyhow::{Result, bail};
 
 mod dlna_controller;
 mod media_server;
@@ -17,22 +15,23 @@ mod bilibili_parser;
 mod playlist_manager;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     println!("=== KTV投屏DLNA应用启动 ===");
 
     let server_port = 8080;
+    let playlist: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let mut playlist_manager = PlaylistManager::new("http://localhost:5823", 0, playlist.clone());
+    
 
     // 1. 创建 Reqwest Client
-    // 注：在 reqwest 0.12.x 中，use_rustls_tls() 是标准 API。
-    // 如果你使用的是特定分支或旧版，请改回你原来的方法名。
     let client = Client::builder()
-        .use_rustls_tls() 
+        .tls_backend_rustls()
         .build()
         .expect("Failed to create client");
     
     let client_data = web::Data::new(client);
 
-    // 2. 配置 HttpServer，但先不运行
+    // 2. 配置 HttpServer，运行
     let server = HttpServer::new(move || {
         App::new()
             .app_data(client_data.clone())
@@ -41,86 +40,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .bind(("0.0.0.0", server_port))?
     .run();
 
-    let server_handle = server.handle();
-
-
-    tokio::spawn(async move {
-        // 等待一下确保服务器 Ready
-        sleep(Duration::from_secs(1)).await;
-
-        match run_dlna_logic(server_port).await {
-            Ok(_) => println!("DLNA 任务执行完毕"),
-            Err(e) => eprintln!("DLNA 任务出错: {}", e),
-        }
-
-        println!("正在关闭服务器...");
-        // 发送停止信号
-        server_handle.stop(true).await;
+    let local_ip = local_ip()?;
+    let controller = DlnaController::new();
+    let devices = controller.discover_devices().await?;
+    if devices.is_empty() {
+        return bail!("No DLNA Devices");
+    }
+    let device = devices[0].clone(); // clone owned copy
+    let device_cloned = device.clone();
+    playlist_manager.start_periodic_update(move |url| {
+        let controller = controller.clone();
+        let device = device.clone();
+        let local_ip = local_ip.clone();
+        Box::pin(async move {
+            controller.set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
+                .await.unwrap();
+            controller.next(&device).await.unwrap();
+        })
     });
 
-    // 5. 【关键修改】在主线程运行服务器
-    // run() 返回的 Server 是 !Send 的，但在 tokio::main 的根任务中可以直接 await
+    tokio::spawn(async move {
+        let controller = DlnaController::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut remaining_secs;
+        loop {
+            interval.tick().await;
+            remaining_secs = controller.get_remaining_secs(&device_cloned).await.unwrap();
+            if remaining_secs <= 2 {
+                playlist_manager.next_song().await.unwrap();
+            }
+        }
+    });
     server.await?;
 
     println!("应用已退出");
     Ok(())
 }
 
-// 将具体的业务逻辑提取出来，保持 main 清晰
-async fn run_dlna_logic(server_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    // 获取本地IP地址
-    let local_ip = local_ip()?;
-    println!("本地IP地址: {}", local_ip);
-
-    // 创建DLNA控制器
-    let controller = DlnaController::new();
-
-    // 发现DLNA设备
-    println!("开始搜索DLNA设备...");
-    let devices = controller.discover_devices().await?;
-
-    if devices.is_empty() {
-        println!("未发现任何DLNA设备");
-        return Ok(());
-    }
-
-    let device = &devices[0];
-    println!("选择设备: {}", device.friendly_name);
-
-    let test_video = "test_videos/12.mp4"; // 这里的路径仅仅为了生成 URI
-    
-    // 设置URI (会触发对 proxy_handler 的调用)
-    // 你的 proxy_handler 实际上会忽略这个路径，去放 B 站视频，这是预期的
-    controller.set_avtransport_uri(
-            device,
-            &format!("/{}", test_video),
-            "", // metadata
-            local_ip,
-            server_port,
-        )
-        .await?;
-
-    sleep(Duration::from_secs(2)).await;
-
-    println!("开始播放...");
-    controller.play(device).await?;
-
-    println!("播放10秒...");
-    sleep(Duration::from_secs(10)).await;
-
-    println!("停止播放...");
-    controller.stop(device).await?;
-    
-    Ok(())
-}
 
 #[get("/{url:.*}")]
 async fn proxy_handler(
     path: web::Path<(String,)>,
     client: web::Data<reqwest::Client>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (_url_path,) = path.into_inner();
-    let target_url = get_bilibili_direct_link("BV1LS4MzKE8y", Some(1)).await.unwrap();
+    let (origin_url,) = path.into_inner();
+    let bv_id = origin_url[..origin_url.find('?').unwrap_or(origin_url.len())].to_string();
+        let page: Option<u32> = if let Some(pos) = origin_url.find("?page=") {
+            origin_url[pos + 6..].parse().ok()
+        } else {
+            None
+        };
+        let target_url = get_bilibili_direct_link(&bv_id, page).await.map_err(actix_web::error::ErrorInternalServerError)?;
 
     let response = client
         .get(&target_url)

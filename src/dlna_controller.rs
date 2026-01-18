@@ -1,11 +1,12 @@
 use futures::stream::StreamExt;
-use reqwest::Client;
 use rupnp::Device;
 use rupnp::ssdp::{SearchTarget, URN};
 use std::net::IpAddr;
 use std::time::Duration;
 use std::collections::HashMap;
 use chrono::NaiveTime;
+use rupnp::http::Uri;
+use futures::future::try_join_all;
 
 // AVTransport服务URN
 const AV_TRANSPORT: URN = URN::service("schemas-upnp-org", "AVTransport", 1);
@@ -20,16 +21,12 @@ pub struct DlnaDevice {
     pub services: Vec<URN>,
 }
 
-// DLNA控制器
-pub struct DlnaController {
-    client: Client,
-}
+#[derive(Clone)]
+pub struct DlnaController;
 
 impl DlnaController {
     pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+        Self
     }
 
     // 发现网络中的DLNA渲染器设备
@@ -78,6 +75,27 @@ impl DlnaController {
             }
         }
 
+        Ok(dlna_devices)
+    }
+
+    pub async fn get_devices_from_urls(&self, urls: &Vec<&'static str>) -> Result<Vec<DlnaDevice>, rupnp::Error> {
+        let devices = try_join_all(
+            urls.iter()
+                .map(|url| {
+                    let uri = Uri::from_static(url);
+                    Device::from_url(uri)
+                })
+        ).await?;
+
+        let dlna_devices: Vec<DlnaDevice> = devices.into_iter().map(|device| DlnaDevice {
+            device:device.clone(),
+            friendly_name: device.friendly_name().to_string(),
+            location: device.url().to_string(),
+            services: device.services()
+                .iter()
+                .map(|s| s.service_type().clone())
+                .collect(),
+        }).collect();
         Ok(dlna_devices)
     }
 
@@ -136,19 +154,22 @@ impl DlnaController {
         device: &DlnaDevice,
         next_uri: &str,
         next_uri_metadata: &str,
+        server_ip: IpAddr,
+        server_port: u16,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let avtransport = self
             .get_avtransport_service(device)
             .ok_or("设备不支持AVTransport服务")?;
 
         let action = "SetNextAVTransportURI";
+        let media_url = format!("http://{}:{}{}", server_ip, server_port, next_uri);
         let args_str = format!(
             r#"
             <InstanceID>0</InstanceID>
             <NextURI>{}</NextURI>
             <NextURIMetaData>{}</NextURIMetaData>
             "#,
-            next_uri, next_uri_metadata
+            media_url, next_uri_metadata
         );
 
         let device_url = device.device.url();
@@ -266,7 +287,7 @@ impl DlnaController {
         Ok(response)
     }
 
-    pub async fn get_remaining_time(
+    pub async fn get_remaining_secs(
         &self,
         device: &DlnaDevice,
     ) -> Result<u32, Box<dyn std::error::Error>> {
@@ -285,4 +306,3 @@ impl DlnaController {
         Ok(remaining_time.num_seconds() as u32)
     }
 }
-
