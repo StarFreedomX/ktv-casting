@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use playlist_manager::PlaylistManager;
 use anyhow::{Result, bail};
+use std::io;
 
 mod dlna_controller;
 mod media_server;
@@ -17,10 +18,51 @@ mod playlist_manager;
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== KTV投屏DLNA应用启动 ===");
+    println!("输入房间链接，如https://ktv.example.com/102");
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .expect("无法读取输入");
+    let url_str = input.trim();
+    // ② 拆分出 base URL
+    // 找到「://」的位置，之后往右找第一个 '/'（路径开始）
+    let scheme_end = match url_str.find("://") {
+        Some(idx) => idx + 3,                // 跳过 "://"
+        None => panic!("输入不是合法的 URL"),
+    };
+
+    let host_end_opt = url_str[scheme_end..].find('/');
+    let host_end = match host_end_opt {
+        Some(pos) => scheme_end + pos,      // 找到路径开始的位置
+        None => url_str.len(),              // 没有任何路径，整个字符串就是 base URL
+    };
+
+    let base_url = &url_str[..host_end];
+    let path_part = &url_str[host_end..];   // 可能以 '/' 开头
+
+    // ③ 从路径中取最后一段（非空）作为 room_id
+    let segments: Vec<&str> = path_part.split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        eprintln!("错误：没有找到房间号");
+        bail!("No room id");
+    }
+
+    let room_str = segments.last().unwrap(); // 最后一个非空段
+    let room_id: u64 = match room_str.parse::<u64>() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("错误：房间号不是合法的整数（{}）", room_str);
+            bail!("Wrong room id");;
+        }
+    };
+
 
     let server_port = 8080;
     let playlist: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
-    let mut playlist_manager = PlaylistManager::new("http://localhost:5823", 0, playlist.clone());
+    let mut playlist_manager = PlaylistManager::new(base_url, room_id, playlist.clone());
     
 
     // 1. 创建 Reqwest Client
@@ -44,9 +86,17 @@ async fn main() -> Result<()> {
     let controller = DlnaController::new();
     let devices = controller.discover_devices().await?;
     if devices.is_empty() {
-        return bail!("No DLNA Devices");
+        bail!("No DLNA Devices");
     }
-    let device = devices[0].clone(); // clone owned copy
+    for (i,device) in devices.iter().enumerate() {
+        println!("{}: {} at {}",i ,device.friendly_name, device.location);
+    }
+    println!("输入设备编号：");
+    input.clear();
+    io::stdin().read_line(&mut input).expect("读取编号失败");
+    let device_num: usize = input.parse()?;
+    if device_num > devices.len() {bail!("编号有误");}
+    let device = devices[device_num].clone(); // clone owned copy
     let device_cloned = device.clone();
     playlist_manager.start_periodic_update(move |url| {
         let controller = controller.clone();
