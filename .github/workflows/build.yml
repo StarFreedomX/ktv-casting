@@ -22,29 +22,35 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # 1. Linux ARM64 (Musl) - Termux/Docker
+          # 1. Linux ARM64 (Musl) - Termux 专用
+          # 关键修改：添加 rustflags 开启 PIE
           - release_for: Linux-aarch64-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             command: cross
+            rustflags: "-C relocation-model=pic -C link-arg=-pie"
 
-          # 2. Linux x64 (Musl) - 通用 Linux
+          # 2. Linux x64 (Musl)
+          # 为了兼容性，也可以给 x86_64 Linux 加上 PIE，或者留空
           - release_for: Linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             command: cross
+            rustflags: "-C relocation-model=pic -C link-arg=-pie"
 
-          # 3. Windows x64 (MSVC)
+          # 3. Windows x64 (MSVC) - 不需要 PIE flags
           - release_for: Windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             command: cargo
+            rustflags: ""
 
-          # 4. macOS ARM64 (Apple Silicon)
-          # - release_for: macOS-aarch64
-          #   os: macos-14
-          #   target: aarch64-apple-darwin
-          #   command: cargo
+          # 4. macOS ARM64 - 不需要手动指定，默认即可
+          - release_for: macOS-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            command: cargo
+            rustflags: ""
 
     steps:
       - name: Checkout
@@ -65,6 +71,11 @@ jobs:
       - name: Build Binary
         shell: bash
         run: |
+          # 导出 RUSTFLAGS 环境变量
+          export RUSTFLAGS="${{ matrix.platform.rustflags }}"
+          
+          echo "Building for ${{ matrix.platform.target }} with flags: $RUSTFLAGS"
+
           if [ "${{ matrix.platform.command }}" == "cross" ]; then
             cross build --release --target ${{ matrix.platform.target }}
           else
@@ -76,16 +87,15 @@ jobs:
         run: |
           mkdir -p dist
           
-          # 定义源文件路径和目标文件名
+          # 根据平台设置扩展名
           if [ "${{ matrix.platform.os }}" == "windows-latest" ]; then
-            SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}.exe"
-            # 目标文件名：your_project-x86_64-pc-windows-msvc.exe
-            DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.exe"
+            EXT=".exe"
           else
-            SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}"
-            # 目标文件名：your_project-aarch64-unknown-linux-musl
-            DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}"
+            EXT=""
           fi
+          
+          SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}$EXT"
+          DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}$EXT"
           
           echo "Moving $SRC to $DST"
           cp "$SRC" "$DST"
@@ -94,6 +104,5 @@ jobs:
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          # 这里使用通配符匹配 dist 下的所有文件
           files: dist/*
           generate_release_notes: true
