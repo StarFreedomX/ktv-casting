@@ -41,10 +41,10 @@ jobs:
             command: cargo
 
           # 4. macOS ARM64 (Apple Silicon)
-          - release_for: macOS-aarch64
-            os: macos-14
-            target: aarch64-apple-darwin
-            command: cargo
+          # - release_for: macOS-aarch64
+          #   os: macos-14
+          #   target: aarch64-apple-darwin
+          #   command: cargo
 
     steps:
       - name: Checkout
