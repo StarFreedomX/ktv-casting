@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
 
     // 1. 创建 Reqwest Client
     let client = Client::builder()
-        .tls_backend_rustls()
+        .use_rustls_tls()
         .build()
         .expect("Failed to create client");
 

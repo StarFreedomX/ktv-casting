@@ -28,7 +28,7 @@ impl PlaylistManager {
 
     async fn fetch_playlist(&mut self) -> Result<Option<String>, String> {
         let client = Client::builder()
-            .tls_backend_rustls()
+            .use_rustls_tls()
             .build()
             .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
 
@@ -169,7 +169,7 @@ impl PlaylistManager {
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
         let client = Client::builder()
-            .tls_backend_rustls()
+            .use_rustls_tls()
             .build()
             .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
         let resp = client
