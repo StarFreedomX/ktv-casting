@@ -73,9 +73,9 @@ impl PlaylistManager {
             // 提取 bilibili://video/ 后面的部分
             if let Some(start) = url.find("bilibili://video/") {
                 let after_prefix = &url[start + "bilibili://video/".len()..];
-                after_prefix.to_string()
+                after_prefix.to_string().replace("?", "-").replace("=", "") // 替换问号和等号，避免DLNA设备不支持
             } else {
-                url.to_string()
+                url.to_string().replace("?", "-").replace("=", "")
             }
         };
 

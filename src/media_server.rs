@@ -2,6 +2,7 @@
 use crate::bilibili_parser::get_bilibili_direct_link;
 use actix_web::{HttpResponse, get, web};
 use futures_util::StreamExt;
+use log::info;
 
 #[get("/{url:.*}")]
 pub async fn proxy_handler(
@@ -9,9 +10,10 @@ pub async fn proxy_handler(
     client: web::Data<reqwest::Client>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (origin_url,) = path.into_inner();
-    let bv_id = &origin_url[..origin_url.find('?').unwrap_or(origin_url.len())];
-    let page: Option<u32> = if let Some(pos) = origin_url.find("?page=") {
-        origin_url[pos + 6..].parse().ok()
+    info!("Proxying request for URL: {}", origin_url);
+    let bv_id = &origin_url[..origin_url.find('-').unwrap_or(origin_url.len())];
+    let page: Option<u32> = if let Some(pos) = origin_url.find("-page") {
+        origin_url[pos + 5..].parse().ok()
     } else {
         None
     };
