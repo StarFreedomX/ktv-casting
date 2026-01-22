@@ -1,16 +1,16 @@
-use crate::bilibili_parser::get_bilibili_direct_link;
 use crate::dlna_controller::DlnaController;
-use actix_web::{App, HttpResponse, HttpServer, get, web};
+use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
+use env_logger;
 use local_ip_address::local_ip;
+use log::{error, info, warn};
 use playlist_manager::PlaylistManager;
 use reqwest::Client;
-use tokio::time::sleep;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use url::Url;
 
 mod bilibili_parser;
@@ -20,6 +20,13 @@ mod playlist_manager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe {
+            std::env::set_var("RUST_LOG", "INFO");
+        }
+    }
+    env_logger::init();
+
     println!("=== KTV投屏DLNA应用启动 ===");
     println!("输入房间链接，如https://ktv.example.com/102");
     let mut input = String::new();
@@ -43,7 +50,7 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
 
     if segments.is_empty() {
-        eprintln!("错误：没有找到房间号");
+        error!("错误：没有找到房间号");
         bail!("No room id")
     }
 
@@ -68,7 +75,7 @@ async fn main() -> Result<()> {
     let server = HttpServer::new(move || {
         App::new()
             .app_data(client_data.clone())
-            .service(proxy_handler)
+            .service(media_server::proxy_handler)
     })
     .bind(("0.0.0.0", server_port))?
     .run();
@@ -106,31 +113,31 @@ async fn main() -> Result<()> {
                     Ok(_) => break,
                     Err(e) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
+                        warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
                 }
             }
-            
+
             // 重试next
             loop {
                 match controller.next(&device).await {
                     Ok(_) => break,
                     Err(e) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("next失败: {}，500ms后重试", error_msg);
+                        warn!("next失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
                 }
             }
-            
+
             // 重试play
             loop {
                 match controller.play(&device).await {
                     Ok(_) => break,
                     Err(e) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("play失败: {}，500ms后重试", error_msg);
+                        warn!("play失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
                 }
@@ -154,20 +161,23 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let error_msg = format!("{}", e);
-                        eprintln!("get_secs失败: {}，500ms后重试", error_msg);
+                        warn!("get_secs失败: {}，500ms后重试", error_msg);
                         sleep(Duration::from_millis(500)).await;
                     }
                 }
             }
             if remaining_secs <= 2 && total_secs > 0 {
-                eprintln!("剩余时间{}秒，总时间{}秒，准备切歌", remaining_secs, total_secs);
+                info!(
+                    "剩余时间{}秒，总时间{}秒，准备切歌",
+                    remaining_secs, total_secs
+                );
                 // 重试next_song
                 loop {
                     match playlist_manager.next_song().await {
                         Ok(_) => break,
                         Err(e) => {
                             let error_msg = format!("{}", e);
-                            eprintln!("next_song失败: {}，500ms后重试", error_msg);
+                            error!("next_song失败: {}，500ms后重试", error_msg);
                             sleep(Duration::from_millis(500)).await;
                         }
                     }
@@ -180,51 +190,4 @@ async fn main() -> Result<()> {
 
     println!("应用已退出");
     Ok(())
-}
-
-#[get("/{url:.*}")]
-async fn proxy_handler(
-    path: web::Path<(String,)>,
-    client: web::Data<reqwest::Client>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let (origin_url,) = path.into_inner();
-    let bv_id = &origin_url[..origin_url.find('?').unwrap_or(origin_url.len())];
-    let page: Option<u32> = if let Some(pos) = origin_url.find("?page=") {
-        origin_url[pos + 6..].parse().ok()
-    } else {
-        None
-    };
-    let target_url = get_bilibili_direct_link(&bv_id, page)
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let response = client
-        .get(&target_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36")
-        .header("Referer", "https://www.bilibili.com/") // 加上这个通常更稳
-        .send()
-        .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let status_u16 = response.status().as_u16();
-    let mut client_resp = HttpResponse::build(
-        actix_web::http::StatusCode::from_u16(status_u16)
-            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR),
-    );
-
-    for (name, value) in response.headers().iter() {
-        let name_str = name.as_str();
-        if name_str != "connection"
-            && name_str != "content-encoding"
-            && name_str != "transfer-encoding"
-        {
-            client_resp.insert_header((name_str, value.as_bytes()));
-        }
-    }
-
-    let body_stream = response
-        .bytes_stream()
-        .map(|item| item.map_err(|e| std::io::Error::other(e)));
-
-    Ok(client_resp.streaming(body_stream))
 }

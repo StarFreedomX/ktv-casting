@@ -1,9 +1,11 @@
+use log::{debug, error, info};
 use reqwest::Client;
 use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
 #[derive(Clone)]
 pub struct PlaylistManager {
     url: String,
@@ -39,7 +41,7 @@ impl PlaylistManager {
             self.url, self.room_id, last_hash
         );
 
-        println!("正在获取播放列表: {}", url);
+        debug!("正在获取播放列表: {}", url);
 
         let resp = client
             .get(&url)
@@ -57,7 +59,7 @@ impl PlaylistManager {
         let changed: bool = resp_json["changed"].as_bool().unwrap_or(false);
 
         if !changed {
-            println!("播放列表未改变，跳过更新");
+            debug!("播放列表未改变，跳过更新");
             return Ok(self.song_playing.lock().await.clone());
         }
 
@@ -95,23 +97,23 @@ impl PlaylistManager {
         // 从 list 数组中提取最后一条状态为 “sung” 的歌单 URL
         let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
             list_array
-            .iter()
-            .rev() // 反转迭代器，从后往前找
-            .find(|item| {
-                item.get("state")
-                .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
-            })
-            .and_then(|item| item["url"].as_str()) // 把 &str 转为 Option<&str>
-            .map(extract_bv_function) // 如果你需要把 url 处理成 bv 等
+                .iter()
+                .rev() // 反转迭代器，从后往前找
+                .find(|item| {
+                    item.get("state")
+                        .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
+                })
+                .and_then(|item| item["url"].as_str()) // 把 &str 转为 Option<&str>
+                .map(extract_bv_function) // 如果你需要把 url 处理成 bv 等
         } else {
             None
         };
 
-        println!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
+        info!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
 
         // 打印每个URL用于调试
         for (i, url) in urls.iter().enumerate() {
-            println!("  {}. {}", i + 1, url);
+            debug!("  {}. {}", i + 1, url);
         }
 
         // 更新播放列表
@@ -144,7 +146,7 @@ impl PlaylistManager {
             loop {
                 interval.tick().await;
                 match self_clone.fetch_playlist().await {
-                    Err(e) => eprintln!("定时更新播放列表失败: {}", e),
+                    Err(e) => error!("定时更新播放列表失败: {}", e),
                     Ok(song_playing_new) => {
                         if song_playing_new != song_playing {
                             if let Some(url) = song_playing_new.clone() {
@@ -213,7 +215,7 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } // <--- 锁在这里被强制释放 (DROP)
         }
-        Err(e) => eprintln!("✗ 获取播放列表失败: {}", e),
+        Err(e) => error!("✗ 获取播放列表失败: {}", e),
     }
 
     // --- 第二次操作 ---
