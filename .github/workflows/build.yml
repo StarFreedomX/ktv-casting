@@ -1,0 +1,99 @@
+name: Cross-Platform Build & Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: ktv_casting
+
+jobs:
+  build-and-upload:
+    name: Build - ${{ matrix.platform.release_for }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # 1. Linux ARM64 (Musl) - Termux/Docker
+          - release_for: Linux-aarch64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            command: cross
+
+          # 2. Linux x64 (Musl) - 通用 Linux
+          - release_for: Linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            command: cross
+
+          # 3. Windows x64 (MSVC)
+          - release_for: Windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            command: cargo
+
+          # 4. macOS ARM64 (Apple Silicon)
+          - release_for: macOS-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            command: cargo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: "${{ matrix.platform.target }}"
+
+      - name: Install Cross
+        if: matrix.platform.command == 'cross'
+        shell: bash
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform.command }}" == "cross" ]; then
+            cross build --release --target ${{ matrix.platform.target }}
+          else
+            cargo build --release --target ${{ matrix.platform.target }}
+          fi
+
+      - name: Rename and Move Binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          
+          # 定义源文件路径和目标文件名
+          if [ "${{ matrix.platform.os }}" == "windows-latest" ]; then
+            SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}.exe"
+            # 目标文件名：your_project-x86_64-pc-windows-msvc.exe
+            DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}.exe"
+          else
+            SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}"
+            # 目标文件名：your_project-aarch64-unknown-linux-musl
+            DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}"
+          fi
+          
+          echo "Moving $SRC to $DST"
+          cp "$SRC" "$DST"
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          # 这里使用通配符匹配 dist 下的所有文件
+          files: dist/*
+          generate_release_notes: true
