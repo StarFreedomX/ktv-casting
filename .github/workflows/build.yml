@@ -22,21 +22,21 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          # 1. Linux ARM64 (Musl) - Termux 专用
-          # 关键修改：添加 rustflags 开启 PIE
-          - release_for: Linux-aarch64-musl
+          # 1. Android ARM64
+          - release_for: Android-aarch64
             os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
+            # 修改 target 为 android
+            target: aarch64-linux-android
             command: cross
-            rustflags: "-C relocation-model=pic -C link-arg=-pie"
+            # Android 默认开启 PIE，通常留空即可；如果报错再尝试加上
+            rustflags: ""
 
           # 2. Linux x64 (Musl)
-          # 为了兼容性，也可以给 x86_64 Linux 加上 PIE，或者留空
           - release_for: Linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             command: cross
-            rustflags: "-C relocation-model=pic -C link-arg=-pie"
+            rustflags: ""
 
           # 3. Windows x64 (MSVC) - 不需要 PIE flags
           - release_for: Windows-x86_64
