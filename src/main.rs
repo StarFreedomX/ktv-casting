@@ -104,10 +104,32 @@ async fn main() -> Result<()> {
         let controller = controller.clone();
         let device = device.clone();
         Box::pin(async move {
-            // 重试设置AVTransport URI
+
+            loop{
+                match controller.stop(&device).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        let error_msg = format!("{}", e);
+                        let error_code: Option<u32> = error_msg
+                            .split(|c: char| !c.is_numeric())
+                            .find(|s| s.len() == 3)
+                            .and_then(|s| s.parse().ok());
+                        if let Some(code) = error_code {
+                            if code / 100 == 2 {
+                                // 2xx错误码视为成功
+                                info!("停止播放返回错误码{}，视为成功", code);
+                                break;
+                            }
+                        }
+                        warn!("停止播放失败: {}，500ms后重试", error_msg);
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+
             loop {
                 match controller
-                    .set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
+                    .set_avtransport_uri(&device, &url, "", local_ip, server_port)
                     .await
                 {
                     Ok(_) => break,
@@ -121,7 +143,7 @@ async fn main() -> Result<()> {
                             if code / 100 == 2 {
                                 // 2xx错误码视为成功
                                 info!("设置AVTransport URI返回错误码{}，视为成功", code);
-                                break;
+                                break
                             }
                         }
                         warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
@@ -129,29 +151,54 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // // 重试设置AVTransport URI
+            // loop {
+            //     match controller
+            //         .set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
+            //         .await
+            //     {
+            //         Ok(_) => break,
+            //         Err(e) => {
+            //             let error_msg = format!("{}", e);
+            //             let error_code: Option<u32> = error_msg
+            //                 .split(|c: char| !c.is_numeric())
+            //                 .find(|s| s.len() == 3)
+            //                 .and_then(|s| s.parse().ok());
+            //             if let Some(code) = error_code {
+            //                 if code / 100 == 2 {
+            //                     // 2xx错误码视为成功
+            //                     info!("设置AVTransport URI返回错误码{}，视为成功", code);
+            //                     break
+            //                 }
+            //             }
+            //             warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
+            //             sleep(Duration::from_millis(500)).await;
+            //         }
+            //     }
+            // }
 
-            // 重试next
-            loop {
-                match controller.next(&device).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        let error_code: Option<u32> = error_msg
-                            .split(|c: char| !c.is_numeric())
-                            .find(|s| s.len() == 3)
-                            .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code {
-                            if code / 100 == 2 {
-                                // 2xx错误码视为成功
-                                info!("设置AVTransport URI返回错误码{}，视为成功", code);
-                                break;
-                            }
-                        }
-                        warn!("next失败: {}，500ms后重试", error_msg);
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
+            // // 重试next
+            // loop {
+            //     match controller.next(&device).await {
+            //         Ok(_) => break,
+            //         Err(e) => {
+            //             let error_msg = format!("{}", e);
+            //             let error_code: Option<u32> = error_msg
+            //                 .split(|c: char| !c.is_numeric())
+            //                 .find(|s| s.len() == 3)
+            //                 .and_then(|s| s.parse().ok());
+            //             if let Some(code) = error_code {
+            //                 if code / 100 == 2 {
+            //                     // 2xx错误码视为成功
+            //                     info!("设置AVTransport URI返回错误码{}，视为成功", code);
+            //                     break;
+            //                 }
+            //             }
+            //             warn!("next失败: {}，500ms后重试", error_msg);
+            //             sleep(Duration::from_millis(500)).await;
+            //         }
+            //     }
+            // }
 
             // 重试play
             loop {
