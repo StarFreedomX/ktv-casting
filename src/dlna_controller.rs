@@ -4,9 +4,151 @@ use futures::stream::StreamExt;
 use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
+
+fn xml_escape(s: &str) -> String {
+    // Minimal XML escaping for element text nodes.
+    // (Enough to keep SOAP XML well-formed when URLs contain & and friends.)
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn build_soap_envelope(action: &str, args_xml: &str) -> String {
+    // Keep the shape consistent with what most renderers accept (and close to your B站抓包).
+    // Note: `rupnp` will build its own envelope too, but we log a best-effort equivalent
+    // so you can diff with a packet capture.
+    format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+        <u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">{args}</u:{action}>
+  </s:Body>
+</s:Envelope>"#,
+        action = action,
+        args = args_xml
+    )
+}
+
+fn device_location_uri(device: &DlnaDevice) -> Result<Uri, rupnp::Error> {
+    device
+        .location
+        .parse::<Uri>()
+        .map_err(|_| rupnp::Error::ParseError("无法解析设备location为Uri"))
+}
+
+fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_xml: &str) {
+    // `service.action()` internally ends up using control_url(base_url).
+    // We can't call the private control_url() here, so we log the base_url and also log
+    // the serviceId/type to help confirm we matched the expected service.
+    //
+    // If you still see 204, compare this log with your抓包，重点确认：Host/port/path。
+    let soap_action_header = format!(
+        "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
+        action
+    );
+
+    // Logged body is a best-effort “wire-like” payload for diffing.
+    let envelope = build_soap_envelope(action, args_xml);
+
+    log::info!(
+        "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction={}",
+        base_url,
+        service.service_id(),
+        service.service_type(),
+        soap_action_header
+    );
+    log::debug!("UPnP Action body (approx) => {}", envelope);
+}
+
+/// Some renderers publish a `controlURL` like `_urn:schemas-upnp-org:service:AVTransport_control`
+/// (missing the leading `/`). In practice the working endpoint is often `/_urn:...`.
+///
+/// `rupnp`'s internal URL replacement may produce the wrong path for such devices.
+/// To make behavior explicit (and loggable), we send the SOAP request ourselves to:
+/// `{scheme}://{host}:{port}/{control_path}`.
+async fn avtransport_action_compat(
+    base_url: &Uri,
+    action: &str,
+    args_xml: &str,
+) -> Result<HashMap<String, String>, rupnp::Error> {
+    let host = base_url
+        .host()
+        .ok_or(rupnp::Error::ParseError("base_url缺少host"))?
+        .to_string();
+    let port = base_url
+        .port_u16()
+        .ok_or(rupnp::Error::ParseError("base_url缺少port"))?;
+    let scheme = base_url
+        .scheme_str()
+        .ok_or(rupnp::Error::ParseError("base_url缺少scheme"))?;
+
+    // Device's description.xml says controlURL is `_urn:...` (no leading slash)
+    // but B站抓包显示 path 是 `/_urn:...`.
+    let control_path = "/_urn:schemas-upnp-org:service:AVTransport_control";
+    let final_url = format!("{}://{}:{}{}", scheme, host, port, control_path);
+
+    let soap_action_header = format!(
+        "\"urn:schemas-upnp-org:service:AVTransport:1#{}\"",
+        action
+    );
+    let body = build_soap_envelope(action, args_xml);
+
+    log::info!(
+        "UPnP Action (compat) -> url={} SOAPAction={}",
+        final_url,
+        soap_action_header
+    );
+    log::debug!("UPnP Action (compat) body => {}", body);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "SOAPAction",
+        HeaderValue::from_str(&soap_action_header)
+            .map_err(|_| rupnp::Error::ParseError("SOAPAction header非法"))?,
+    );
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/xml; charset=\"utf-8\""),
+    );
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|_| rupnp::Error::ParseError("创建reqwest client失败"))?;
+
+    let resp = client
+        .post(&final_url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| rupnp::Error::ParseError(Box::leak(format!("发送SOAP请求失败: {}", e).into_boxed_str())))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| rupnp::Error::ParseError(Box::leak(format!("读取SOAP响应失败: {}", e).into_boxed_str())))?;
+
+    if status.as_u16() != 200 {
+        // Non-200 treated as error. Include status + body for diagnosis.
+        log::warn!("UPnP Action (compat) status={} body={}", status, text);
+        return Err(rupnp::Error::ParseError(Box::leak(
+            format!("AVTransport返回HTTP状态码{}", status.as_u16()).into_boxed_str(),
+        )));
+    }
+
+    // For now we only need a success/failure signal for this renderer.
+    // If you later need response fields, we can add an XML parser crate explicitly.
+    log::debug!("UPnP Action (compat) status=200 body={}", text);
+    Ok(HashMap::new())
+}
 
 // AVTransport服务URN
 const AV_TRANSPORT: URN = URN::service("schemas-upnp-org", "AVTransport", 1);
@@ -135,17 +277,16 @@ impl DlnaController {
         // 准备SOAP请求参数
         let action = "SetAVTransportURI";
         let args_str = format!(
-            r#"
-            <InstanceID>0</InstanceID>
-            <CurrentURI>{}</CurrentURI>
-            <CurrentURIMetaData>{}</CurrentURIMetaData>
-            "#,
-            media_url, current_uri_metadata
+            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
+            xml_escape(&media_url),
+            current_uri_metadata
         );
 
-        // 发送SOAP请求 - 使用device.url()而不是service.url()
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        // 发送SOAP请求 - 统一使用设备描述文档URL(location)作为base url
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, &args_str);
+    // Workaround for devices whose controlURL lacks a leading slash.
+    let response = avtransport_action_compat(&base_url, action, &args_str).await?;
 
         log::debug!("SetAVTransportURI响应: {:?}", response);
 
@@ -168,16 +309,14 @@ impl DlnaController {
         let action = "SetNextAVTransportURI";
         let media_url = format!("http://{}:{}/{}", server_ip, server_port, next_uri);
         let args_str = format!(
-            r#"
-            <InstanceID>0</InstanceID>
-            <NextURI>{}</NextURI>
-            <NextURIMetaData>{}</NextURIMetaData>
-            "#,
-            media_url, next_uri_metadata
+            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData>",
+            xml_escape(&media_url),
+            next_uri_metadata
         );
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, &args_str);
+    let response = avtransport_action_compat(&base_url, action, &args_str).await?;
 
         log::debug!("SetNextAVTransportURI响应: {:?}", response);
 
@@ -192,13 +331,11 @@ impl DlnaController {
 
         log::info!("正在发送Play指令...");
         let action = "Play";
-        let args_str = r#"
-            <InstanceID>0</InstanceID>
-            <Speed>1</Speed>
-            "#;
+        let args_str = "<InstanceID>0</InstanceID><Speed>1</Speed>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
         log::debug!("Play响应: {:?}", response);
 
         Ok(())
@@ -214,8 +351,9 @@ impl DlnaController {
         let action = "Pause";
         let args_str = "<InstanceID>0</InstanceID>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
         log::debug!("Pause响应: {:?}", response);
 
         Ok(())
@@ -231,8 +369,9 @@ impl DlnaController {
         let action = "Stop";
         let args_str = "<InstanceID>0</InstanceID>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
         log::debug!("Stop响应: {:?}", response);
 
         Ok(())
@@ -247,8 +386,9 @@ impl DlnaController {
         let action = "Next";
         let args_str = "<InstanceID>0</InstanceID>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
         log::debug!("Next响应: {:?}", response);
 
         Ok(())
@@ -263,8 +403,9 @@ impl DlnaController {
         let action = "GetTransportInfo";
         let args_str = "<InstanceID>0</InstanceID>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
         log::debug!("传输信息: {:?}", response);
 
         Ok(())
@@ -282,8 +423,9 @@ impl DlnaController {
         let action = "GetPositionInfo";
         let args_str = "<InstanceID>0</InstanceID>";
 
-        let device_url = device.device.url();
-        let response = avtransport.action(device_url, action, &args_str).await?;
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, args_str);
+    let response = avtransport_action_compat(&base_url, action, args_str).await?;
 
         // 解析响应
         let mut result = HashMap::new();
@@ -340,10 +482,30 @@ impl DlnaController {
             volume
         );
 
-        let device_url = device.device.url();
-        let response = rendering_control
-            .action(device_url, action, &args_str)
-            .await?;
+        let base_url = device_location_uri(device)?;
+        // RenderingControl uses a different service; still log with a reasonable SOAPAction.
+        log::info!(
+            "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
+            base_url,
+            rendering_control.service_id(),
+            rendering_control.service_type(),
+            action
+        );
+        log::debug!(
+            "UPnP Action body (approx) => {}",
+            format!(
+                r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">
+  <s:Body>
+    <u:{action} xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">{args}</u:{action}>
+  </s:Body>
+</s:Envelope>"#,
+                action = action,
+                args = args_str
+            )
+        );
+
+        let response = rendering_control.action(&base_url, action, &args_str).await?;
         log::debug!("SetVolume响应: {:?}", response);
 
         Ok(())
@@ -364,10 +526,29 @@ impl DlnaController {
             <Channel>Master</Channel>
             "#;
 
-        let device_url = device.device.url();
-        let response = rendering_control
-            .action(device_url, action, &args_str)
-            .await?;
+        let base_url = device_location_uri(device)?;
+        log::info!(
+            "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
+            base_url,
+            rendering_control.service_id(),
+            rendering_control.service_type(),
+            action
+        );
+        log::debug!(
+            "UPnP Action body (approx) => {}",
+            format!(
+                r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<s:Envelope s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">
+  <s:Body>
+    <u:{action} xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">{args}</u:{action}>
+  </s:Body>
+</s:Envelope>"#,
+                action = action,
+                args = args_str
+            )
+        );
+
+        let response = rendering_control.action(&base_url, action, &args_str).await?;
 
         // 解析音量值
         let default_volume = "0".to_string();
