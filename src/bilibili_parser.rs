@@ -12,13 +12,9 @@ use log::warn;
 /// * `Result<String, String>` - 返回直链URL或错误信息
 pub async fn get_bilibili_direct_link(bv_id: &str, page: Option<u32>) -> Result<String, String> {
     let client = Client::new();
-    let mut page = page.unwrap_or(1);
+    let mut page = page.unwrap_or(0);
 
-    // Page is 1-based for bilibili APIs. Guard against 0 to avoid (page - 1) underflow.
-    if page == 0 {
-        warn!("Invalid page number: page must start from 1. Defaulting to page 1.");
-        page = 1;
-    }
+
 
     // 第一步：获取CID
     let cid = get_video_cid(&client, bv_id, page).await?;
@@ -63,15 +59,10 @@ async fn get_video_cid(client: &Client, bv_id: &str, page: u32) -> Result<String
         return Err("该视频没有可用的分P数据".to_string());
     }
 
-    // bilibili page is 1-based.
-    if page == 0 {
-        return Err("无效的分P: page 必须从 1 开始".to_string());
-    }
-
-    let idx = (page - 1) as usize;
+    let idx = page as usize;
     if idx >= data.len() {
         return Err(format!(
-            "无效的分P: page={}, 有效范围: 1..={}, 总分P数: {}",
+            "无效的分P: page={}, 有效范围: 0..{}, 总分P数: {}",
             page,
             data.len(),
             data.len()
