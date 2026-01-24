@@ -168,11 +168,6 @@ async fn avtransport_action_compat(
         }
     }
 
-    // 设备特定回退路径（不再使用硬编码 UUID）
-    if service_debug.contains("Myou Media Renderer") {
-        possible_paths.push("/_urn:schemas-upnp-org:service:AVTransport_control".to_string());
-    }
-
     // 通用回退路径
     possible_paths.extend(
         [
@@ -182,7 +177,7 @@ async fn avtransport_action_compat(
             "control/AVTransport",
         ]
         .into_iter()
-        .map(|p| normalize_control_path(p)),
+        .map(|p| normalize_control_path(p)), // 规范化路径,增加/
     );
 
     // 尝试匹配可能的路径模式
