@@ -2,30 +2,36 @@ use chrono::{NaiveTime, Timelike};
 use futures::future::try_join_all;
 use futures::stream::StreamExt;
 use quick_xml::escape::escape;
+use quick_xml::events::Event;
+use quick_xml::name::QName;
+use quick_xml::reader::Reader;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::time::Duration;
 
 fn extract_xml_tag_value(xml: &str, tag: &str) -> Option<String> {
-    // 解析XML标签值，支持带命名空间属性的标签
-    let start_pattern = format!("<{}", tag);
-    let end_pattern = format!("</{}>", tag);
+    // 解析XML标签值 使用 quick_xml Reader API
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
 
-    // 找到开始标签
-    if let Some(start_idx) = xml.find(&start_pattern) {
-        // 找到开始标签的结束位置 >
-        if let Some(tag_end_idx) = xml[start_idx..].find('>') {
-            let value_start = start_idx + tag_end_idx + 1;
+    let tag_bytes = tag.as_bytes();
+    let qname = QName(tag_bytes);
 
-            // 找到对应的结束标签
-            if let Some(value_end) = xml[value_start..].find(&end_pattern) {
-                let value = &xml[value_start..value_start + value_end];
-                return Some(value.trim().to_string());
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.name() == qname => match reader.read_text(qname) {
+                Ok(text) => return Some(text.to_string()),
+                Err(_) => return None,
+            },
+            Ok(Event::Empty(ref e)) if e.name() == qname => {
+                // 自闭合标签，返回空字符串
+                return Some(String::new());
             }
+            Err(_) | Ok(Event::Eof) => break,
+            _ => {}
         }
     }
 
@@ -76,11 +82,11 @@ fn build_soap_envelope(action: &str, args_xml: &str) -> String {
     // so you can diff with a packet capture.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-  <s:Body>
-        <u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">{args}</u:{action}>
-  </s:Body>
-</s:Envelope>"#,
+        <s:Envelope s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+        <s:Body>
+                <u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">{args}</u:{action}>
+        </s:Body>
+        </s:Envelope>"#,
         action = action,
         args = args_xml
     )
@@ -414,50 +420,6 @@ impl DlnaController {
     pub async fn set_avtransport_uri(
         &self,
         device: &DlnaDevice,
-        current_uri: &str,
-        current_uri_metadata: &str,
-        server_ip: IpAddr,
-        server_port: u16,
-    ) -> Result<(), rupnp::Error> {
-        let avtransport = self
-            .get_avtransport_service(device)
-            .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
-
-        // 构建完整的媒体URL
-        let media_url = format!("http://{}:{}/{}", server_ip, server_port, current_uri);
-
-        log::info!("设置媒体URI: {}", media_url);
-        log::debug!("元数据(传入): {}", current_uri_metadata);
-
-        // If caller didn't provide metadata, generate a minimal DIDL-Lite for compatibility.
-        let metadata = if current_uri_metadata.trim().is_empty() {
-            // Title can be anything; devices often only care about protocolInfo.
-            build_didl_lite_metadata(current_uri, &media_url, None)
-        } else {
-            current_uri_metadata.to_string()
-        };
-
-        // 准备SOAP请求参数 - 只使用标准参数以提高兼容性
-        let action = "SetAVTransportURI";
-        let args_str = format!(
-            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
-            xml_escape(&media_url),
-            metadata
-        );
-
-        // 发送SOAP请求 - 统一使用设备描述文档URL(location)作为base url
-        let base_url = device_location_uri(device)?;
-        log_upnp_action(avtransport, &base_url, action, &args_str);
-        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
-
-        log::debug!("SetAVTransportURI响应: {:?}", response);
-
-        Ok(())
-    }
-
-    pub async fn set_avtransport_uri_direct(
-        &self,
-        device: &DlnaDevice,
         media_url: &str,
         current_uri_metadata: &str,
     ) -> Result<(), rupnp::Error> {
@@ -500,24 +462,21 @@ impl DlnaController {
         device: &DlnaDevice,
         next_uri: &str,
         next_uri_metadata: &str,
-        server_ip: IpAddr,
-        server_port: u16,
     ) -> Result<(), rupnp::Error> {
         let avtransport = self
             .get_avtransport_service(device)
             .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
 
         let action = "SetNextAVTransportURI";
-        let media_url = format!("http://{}:{}/{}", server_ip, server_port, next_uri);
         let metadata = if next_uri_metadata.trim().is_empty() {
-            build_didl_lite_metadata(next_uri, &media_url, None)
+            build_didl_lite_metadata(next_uri, next_uri, None)
         } else {
             next_uri_metadata.to_string()
         };
 
         let args_str = format!(
             "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{}</NextURIMetaData>",
-            xml_escape(&media_url),
+            xml_escape(next_uri),
             metadata
         );
 
@@ -806,48 +765,5 @@ impl DlnaController {
         let volume: u32 = volume_str.parse().unwrap_or(0);
 
         Ok(volume)
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_set_next_avtransport_uri() {
-        let controller = DlnaController::new();
-
-        // 发现DLNA设备
-        let devices = controller.discover_devices().await;
-        match devices {
-            Ok(devices) => {
-                if devices.is_empty() {
-                    println!("未发现DLNA设备，跳过测试");
-                    return;
-                }
-
-                // 使用第一个设备
-                let device = &devices[0];
-                println!("使用设备: {}", device.friendly_name);
-
-                // 测试设置下一首媒体URI
-                let result = controller
-                    .set_next_avtransport_uri(
-                        device,
-                        "/media/test_next.mp4",
-                        "",
-                        "127.0.0.1".parse().unwrap(),
-                        8080,
-                    )
-                    .await;
-
-                match result {
-                    Ok(_) => println!("设置下一首媒体URI成功"),
-                    Err(e) => println!("设置下一首媒体URI失败: {}", e),
-                }
-            }
-            Err(e) => {
-                println!("设备发现失败: {}", e);
-            }
-        }
     }
 }

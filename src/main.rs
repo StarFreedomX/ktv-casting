@@ -1,10 +1,8 @@
 use crate::dlna_controller::DlnaController;
-use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, anyhow, bail};
-use local_ip_address::local_ip;
+use bilibili_parser::get_bilibili_direct_link;
 use log::{error, info, warn};
 use playlist_manager::PlaylistManager;
-use reqwest::Client;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +12,6 @@ use url::Url;
 
 mod bilibili_parser;
 mod dlna_controller;
-mod media_server;
 mod playlist_manager;
 
 #[tokio::main]
@@ -58,28 +55,9 @@ async fn main() -> Result<()> {
         .parse::<u64>()
         .with_context(|| format!("Error parsing room_str {}", room_str))?;
 
-    let server_port = 8080;
     let playlist: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let mut playlist_manager = PlaylistManager::new(&base_url, room_id, playlist.clone());
 
-    // 1. 创建 Reqwest Client
-    let client = Client::builder()
-        .use_rustls_tls()
-        .build()
-        .expect("Failed to create client");
-
-    let client_data = web::Data::new(client);
-
-    // 2. 配置 HttpServer，运行
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(client_data.clone())
-            .service(media_server::proxy_handler)
-    })
-    .bind(("0.0.0.0", server_port))?
-    .run();
-
-    let local_ip = local_ip()?;
     let controller = DlnaController::new();
     let devices = controller.discover_devices().await?;
     if devices.is_empty() {
@@ -136,7 +114,7 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let target_url = crate::bilibili_parser::get_bilibili_direct_link(bv_id, page).await;
+            let target_url = get_bilibili_direct_link(bv_id, page).await;
             let url = match target_url {
                 Ok(u) => u,
                 Err(e) => {
@@ -146,11 +124,7 @@ async fn main() -> Result<()> {
             };
 
             loop {
-                match controller
-                    // .set_avtransport_uri(&device, &url, "", local_ip, server_port)
-                    .set_avtransport_uri_direct(&device, &url, "")
-                    .await
-                {
+                match controller.set_avtransport_uri(&device, &url, "").await {
                     Ok(_) => {
                         info!("成功设置AVTransport URI为 {}", url);
                         break;
@@ -177,7 +151,7 @@ async fn main() -> Result<()> {
             // // 重试设置AVTransport URI
             // loop {
             //     match controller
-            //         .set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
+            //         .set_next_avtransport_uri(&device, &url, "")
             //         .await
             //     {
             //         Ok(_) => break,
@@ -309,8 +283,9 @@ async fn main() -> Result<()> {
             }
         }
     });
-    server.await?;
 
+    // 等待CTRL+C信号
+    tokio::signal::ctrl_c().await?;
     println!("应用已退出");
     Ok(())
 }
