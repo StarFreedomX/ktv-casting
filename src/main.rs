@@ -129,9 +129,26 @@ async fn main() -> Result<()> {
                 }
             }
 
+            let bv_id = &url[..url.find('-').unwrap_or(url.len())];
+            let page: Option<u32> = if let Some(pos) = url.find("-page") {
+                url[pos + 5..].parse().ok()
+            } else {
+                None
+            };
+
+            let target_url = crate::bilibili_parser::get_bilibili_direct_link(bv_id, page).await;
+            let url = match target_url {
+                Ok(u) => u,
+                Err(e) => {
+                    error!("获取视频直链失败: {}", e);
+                    return;
+                }
+            };
+
             loop {
                 match controller
-                    .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                    // .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                    .set_avtransport_uri_direct(&device, &url, "")
                     .await
                 {
                     Ok(_) => {

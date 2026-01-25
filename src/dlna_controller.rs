@@ -1,6 +1,7 @@
 use chrono::{NaiveTime, Timelike};
 use futures::future::try_join_all;
 use futures::stream::StreamExt;
+use quick_xml::escape::escape;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
 use rupnp::http::Uri;
@@ -37,13 +38,7 @@ fn is_unknown_time(s: &str) -> bool {
 }
 
 fn xml_escape(s: &str) -> String {
-    // Minimal XML escaping for element text nodes.
-    // (Enough to keep SOAP XML well-formed when URLs contain & and friends.)
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    escape(s).to_string()
 }
 
 fn build_didl_lite_metadata(title: &str, media_url: &str, protocol_info: Option<&str>) -> String {
@@ -447,6 +442,45 @@ impl DlnaController {
         let args_str = format!(
             "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
             xml_escape(&media_url),
+            metadata
+        );
+
+        // 发送SOAP请求 - 统一使用设备描述文档URL(location)作为base url
+        let base_url = device_location_uri(device)?;
+        log_upnp_action(avtransport, &base_url, action, &args_str);
+        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
+
+        log::debug!("SetAVTransportURI响应: {:?}", response);
+
+        Ok(())
+    }
+
+    pub async fn set_avtransport_uri_direct(
+        &self,
+        device: &DlnaDevice,
+        media_url: &str,
+        current_uri_metadata: &str,
+    ) -> Result<(), rupnp::Error> {
+        let avtransport = self
+            .get_avtransport_service(device)
+            .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
+
+        log::info!("设置媒体URI: {}", media_url);
+        log::debug!("元数据(传入): {}", current_uri_metadata);
+
+        // If caller didn't provide metadata, generate a minimal DIDL-Lite for compatibility.
+        let metadata = if current_uri_metadata.trim().is_empty() {
+            // Title can be anything; devices often only care about protocolInfo.
+            build_didl_lite_metadata(media_url, media_url, None)
+        } else {
+            current_uri_metadata.to_string()
+        };
+
+        // 准备SOAP请求参数 - 只使用标准参数以提高兼容性
+        let action = "SetAVTransportURI";
+        let args_str = format!(
+            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
+            xml_escape(media_url),
             metadata
         );
 
