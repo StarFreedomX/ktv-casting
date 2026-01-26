@@ -1,6 +1,7 @@
 use crate::messages::Message;
 use crate::tui_app::{AppState, TuiApp};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use log::{error, info};
 use tokio::sync::mpsc;
 use tui_input::InputRequest;
 
@@ -9,10 +10,13 @@ pub async fn handle_events(
     tx: &mpsc::UnboundedSender<Message>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // 使用较短的超时时间以获得更好的响应性
-    if event::poll(std::time::Duration::from_millis(10))? {
+    if event::poll(std::time::Duration::from_millis(0))? {
         if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                return Ok(true);
+            }
             match &app.state {
-                AppState::Startup => handle_startup_events(app, key)?,
+                AppState::Startup => handle_startup_events(app, key, tx)?,
                 AppState::SelectDevice => handle_device_selection_events(app, key)?,
                 AppState::Playing | AppState::Paused => handle_player_events(app, key, tx)?,
                 AppState::Error(_) => handle_error_events(app, key)?,
@@ -25,6 +29,7 @@ pub async fn handle_events(
 fn handle_startup_events(
     app: &mut TuiApp,
     key: KeyEvent,
+    _tx: &mpsc::UnboundedSender<Message>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -52,12 +57,13 @@ fn handle_startup_events(
                             let room_str = segments.last().unwrap();
                             if let Ok(room_id) = room_str.parse::<u64>() {
                                 app.set_room_info(base_url, room_id);
-                                app.is_loading = true;
-                                // 这里应该触发搜索DLNA设备的异步操作
-                                // 在实际实现中，我们会调用DLNA控制器来搜索设备
+                                app.is_loading = false;
+                                app.device_search_started = false;
+                                info!("房间链接验证通过，进入设备选择界面");
                                 app.update_state(AppState::SelectDevice);
                             } else {
                                 // 房间ID不是数字，显示错误
+                                error!("房间ID必须是数字: {}", room_str);
                                 app.update_state(AppState::Error(format!("房间ID必须是数字")));
                             }
                         } else {
@@ -116,6 +122,9 @@ fn handle_device_selection_events(
         }
         KeyCode::Esc => {
             // 返回上一状态（输入房间链接）
+            app.is_loading = false;
+            app.device_search_started = false;
+            app.devices.clear();
             app.update_state(AppState::Startup);
         }
         _ => {}

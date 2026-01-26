@@ -1,19 +1,17 @@
 use crate::dlna_controller::DlnaController;
-use anyhow::{Context, Result, anyhow, bail};
-use bilibili_parser::get_bilibili_direct_link;
+use anyhow::{anyhow, Result};
+use chrono::Local;
 use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use log::{error, info, warn};
+use log::{error, info, warn, LevelFilter};
 use playlist_manager::PlaylistManager;
-use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::sleep;
-use url::Url;
+use ratatui::Terminal;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{mpsc, Mutex};
 
 mod bilibili_parser;
 mod dlna_controller;
@@ -28,6 +26,34 @@ use messages::Message;
 use tui_app::{AppState, TuiApp};
 use tui_renderer::ui;
 
+struct FileLogger {
+    file: Arc<StdMutex<std::fs::File>>,
+    level: LevelFilter,
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.level
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if let Ok(mut file) = self.file.lock() {
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(file, "{} [{}] {}", now, record.level(), record.args());
+            let _ = file.flush();
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::var("RUST_LOG").is_err() {
@@ -35,7 +61,32 @@ async fn main() -> Result<()> {
             std::env::set_var("RUST_LOG", "INFO");
         }
     }
-    env_logger::init();
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("ktv-casting.log")?;
+    let log_file = Arc::new(StdMutex::new(log_file));
+    if let Ok(mut file) = log_file.lock() {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(file, "{} [INFO] 日志启动", now);
+        let _ = file.flush();
+    }
+    let panic_log = Arc::clone(&log_file);
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut file) = panic_log.lock() {
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(file, "{} [PANIC] {}", now, info);
+            let _ = file.flush();
+        }
+    }));
+
+    let logger = FileLogger {
+        file: Arc::clone(&log_file),
+        level: LevelFilter::Info,
+    };
+    log::set_boxed_logger(Box::new(logger)).map_err(|e| anyhow!(e))?;
+    log::set_max_level(LevelFilter::Info);
+    info!("日志初始化完成");
 
     // 初始化终端
     enable_raw_mode()?;
@@ -83,6 +134,7 @@ async fn main() -> Result<()> {
                 Message::DevicesFound(devices) => {
                     app.set_devices(devices);
                     app.is_loading = false;
+                    info!("设备搜索完成，共找到 {} 个可用设备", app.devices.len());
                 }
                 Message::RoomInfo(url, id) => {
                     app.set_room_info(url, id);
@@ -112,57 +164,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 Message::Error(err) => {
+                    let err_msg = err.clone();
                     app.update_state(AppState::Error(err));
                     app.is_loading = false;  // 确保在错误情况下也停止加载状态
-                }
-            }
-        }
-
-        // 处理播放控制命令
-        if let Some(ref device) = app.selected_device {
-            // 处理播放/暂停状态变化
-            if let AppState::Playing = app.state {
-                // 检查是否需要发送播放命令
-                match controller.get_playback_state(device).await {
-                    Ok(state) if state != "PLAYING" => {
-                        // 发送播放命令
-                        if let Err(e) = controller.play(device).await {
-                            error!("发送播放命令失败: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("获取播放状态失败: {}", e);
-                    }
-                    _ => {} // 状态已经是PLAYING，无需操作
-                }
-            } else if let AppState::Paused = app.state {
-                // 检查是否需要发送暂停命令
-                match controller.get_playback_state(device).await {
-                    Ok(state) if state == "PLAYING" => {
-                        // 发送暂停命令
-                        if let Err(e) = controller.pause(device).await {
-                            error!("发送暂停命令失败: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("获取播放状态失败: {}", e);
-                    }
-                    _ => {} // 状态已经是PAUSED或STOPPED，无需操作
-                }
-            }
-
-            // 处理音量变化
-            match controller.get_volume(device).await {
-                Ok(current_vol) => {
-                    if current_vol != app.volume {
-                        // 发送音量设置命令
-                        if let Err(e) = controller.set_volume(device, app.volume).await {
-                            error!("设置音量失败: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("获取当前音量失败: {}", e);
+                    error!("设备搜索错误: {}", err_msg);
                 }
             }
         }
@@ -175,25 +180,31 @@ async fn main() -> Result<()> {
             }
             AppState::SelectDevice => {
                 // 如果还没有搜索过设备，则开始搜索
-                if app.devices.is_empty() && !app.is_loading {
+                if app.devices.is_empty() && !app.device_search_started {
+                    info!("进入设备选择界面，开始搜索DLNA设备...");
                     app.is_loading = true;
+                    app.device_search_started = true;
 
                     // 异步搜索DLNA设备
                     let tx_clone = tx.clone();
                     let controller_clone = controller.clone();
 
                     tokio::spawn(async move {
-                        match controller_clone.discover_devices().await {
+                        info!("开始执行设备搜索任务");
+                        let result = controller_clone.discover_devices().await;
+                        match result {
                             Ok(devices) => {
+                                info!("设备搜索任务完成，找到 {} 个设备", devices.len());
                                 if devices.is_empty() {
-                                    // 如果没有找到设备，发送错误消息
-                                    let _ = tx_clone
-                                        .send(Message::Error("未找到DLNA设备，请确保设备在同一网络中".to_string()));
+                                    let _ = tx_clone.send(Message::DevicesFound(vec![]));
                                 } else {
                                     let _ = tx_clone.send(Message::DevicesFound(devices));
                                 }
                             }
                             Err(e) => {
+                                error!("设备搜索任务失败: {}", e);
+                                let _ = tx_clone
+                                    .send(Message::DevicesFound(vec![]));
                                 let _ = tx_clone
                                     .send(Message::Error(format!("搜索DLNA设备失败: {}", e)));
                             }
@@ -204,7 +215,8 @@ async fn main() -> Result<()> {
             AppState::Playing | AppState::Paused => {
                 // 在播放状态下，如果还没有播放列表管理器，则创建它
                 if let (Some(room_url), Some(room_id)) = (&app.room_url, app.room_id) {
-                    if app.selected_device.is_some() {
+                    if app.selected_device.is_some() && !app.playback_tasks_started {
+                        app.playback_tasks_started = true;
                         let playlist_manager =
                             PlaylistManager::new(room_url, room_id, playlist.clone());
                         let controller_clone = controller.clone();
@@ -263,43 +275,76 @@ async fn main() -> Result<()> {
                                 }
                             }
                         });
-
-                        // 启动播放状态和音量监控
-                        let controller_clone = controller.clone();
-                        let device = app.selected_device.as_ref().unwrap().clone();
-                        let tx_clone = tx.clone();
-                        tokio::spawn(async move {
-                            let mut interval =
-                                tokio::time::interval(std::time::Duration::from_secs(2));
-                            loop {
-                                interval.tick().await;
-                                // 获取播放状态
-                                match controller_clone.get_playback_state(&device).await {
-                                    Ok(state) => {
-                                        info!("播放状态: {}", state);
-                                        // 根据播放状态更新UI - 这里我们简单记录状态，实际UI更新通过其他方式处理
-                                    }
-                                    Err(e) => {
-                                        warn!("获取播放状态失败: {}", e);
-                                    }
-                                }
-
-                                // 获取音量
-                                match controller_clone.get_volume(&device).await {
-                                    Ok(volume) => {
-                                        let _ = tx_clone.send(Message::VolumeChanged(volume));
-                                    }
-                                    Err(e) => {
-                                        warn!("获取音量失败: {}", e);
-                                    }
-                                }
-                            }
-                        });
                     }
                 }
             }
             AppState::Error(_) => {
                 // 错误状态下等待用户操作
+            }
+        }
+
+        // 处理播放控制命令（节流）
+        if let Some(ref device) = app.selected_device {
+            let now = std::time::Instant::now();
+            let should_sync_playback = app
+                .last_playback_sync
+                .map(|t| now.duration_since(t) >= std::time::Duration::from_millis(500))
+                .unwrap_or(true);
+            let should_sync_volume = app
+                .last_volume_sync
+                .map(|t| now.duration_since(t) >= std::time::Duration::from_millis(500))
+                .unwrap_or(true);
+
+            if should_sync_playback {
+                app.last_playback_sync = Some(now);
+                // 处理播放/暂停状态变化
+                if let AppState::Playing = app.state {
+                    // 检查是否需要发送播放命令
+                    match controller.get_playback_state(device).await {
+                        Ok(state) if state != "PLAYING" => {
+                            // 发送播放命令
+                            if let Err(e) = controller.play(device).await {
+                                error!("发送播放命令失败: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("获取播放状态失败: {}", e);
+                        }
+                        _ => {} // 状态已经是PLAYING，无需操作
+                    }
+                } else if let AppState::Paused = app.state {
+                    // 检查是否需要发送暂停命令
+                    match controller.get_playback_state(device).await {
+                        Ok(state) if state == "PLAYING" => {
+                            // 发送暂停命令
+                            if let Err(e) = controller.pause(device).await {
+                                error!("发送暂停命令失败: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("获取播放状态失败: {}", e);
+                        }
+                        _ => {} // 状态已经是PAUSED或STOPPED，无需操作
+                    }
+                }
+            }
+
+            if should_sync_volume {
+                app.last_volume_sync = Some(now);
+                // 处理音量变化
+                match controller.get_volume(device).await {
+                    Ok(current_vol) => {
+                        if current_vol != app.volume {
+                            // 发送音量设置命令
+                            if let Err(e) = controller.set_volume(device, app.volume).await {
+                                error!("设置音量失败: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("获取当前音量失败: {}", e);
+                    }
+                }
             }
         }
 
@@ -326,7 +371,7 @@ async fn play_url(
     controller: &DlnaController,
     device: &dlna_controller::DlnaDevice,
     url: &str,
-    tx: mpsc::UnboundedSender<Message>,
+    _tx: mpsc::UnboundedSender<Message>,
 ) {
     use crate::bilibili_parser::get_bilibili_direct_link;
     use std::time::Duration;

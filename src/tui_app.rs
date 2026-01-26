@@ -1,7 +1,5 @@
 use crate::dlna_controller::DlnaDevice;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::time::Instant;
 use tui_input::Input;
 
 #[derive(Clone)]
@@ -32,6 +30,13 @@ pub struct TuiApp {
     // 添加输入去重字段
     pub last_char_input_time: Option<Instant>,
     pub last_char_input: Option<char>,
+    // 设备搜索是否已启动
+    pub device_search_started: bool,
+    // 播放相关任务是否已启动
+    pub playback_tasks_started: bool,
+    // 播放/音量同步节流
+    pub last_playback_sync: Option<Instant>,
+    pub last_volume_sync: Option<Instant>,
 }
 
 impl TuiApp {
@@ -51,10 +56,25 @@ impl TuiApp {
             room_id: None,
             last_char_input_time: None,
             last_char_input: None,
+            device_search_started: false,
+            playback_tasks_started: false,
+            last_playback_sync: None,
+            last_volume_sync: None,
         }
     }
 
     pub fn update_state(&mut self, new_state: AppState) {
+        let leaving_playback = matches!(self.state, AppState::Playing | AppState::Paused)
+            && !matches!(new_state, AppState::Playing | AppState::Paused);
+        let entering_playback = !matches!(self.state, AppState::Playing | AppState::Paused)
+            && matches!(new_state, AppState::Playing | AppState::Paused);
+
+        if leaving_playback || entering_playback {
+            self.playback_tasks_started = false;
+            self.last_playback_sync = None;
+            self.last_volume_sync = None;
+        }
+
         self.state = new_state;
     }
 

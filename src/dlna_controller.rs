@@ -10,6 +10,7 @@ use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 fn extract_xml_tag_value(xml: &str, tag: &str) -> Option<String> {
@@ -339,32 +340,27 @@ impl DlnaController {
         // 搜索所有设备，而不仅仅是AVTransport服务
         // 使用upnp:all作为搜索目标，这与命令行工具保持一致
         let search_target = SearchTarget::All;
-        let devices_stream = rupnp::discover(&search_target, Duration::from_secs(5), None).await?;
-
-        // 使用超时来收集设备，避免无限期等待
-        let devices_result = tokio::time::timeout(
-            Duration::from_secs(7), // 总超时时间比搜索时间稍长
-            devices_stream.collect::<Vec<_>>()
-        ).await;
-
-        let devices = match devices_result {
-            Ok(results) => {
-                log::info!("设备搜索完成，共找到 {} 个响应", results.len());
-                results // 成功收集到设备
-            },
-            Err(_) => {
-                log::warn!("设备搜索超时");
-                Vec::new() // 超时情况下返回空列表
+        let devices_stream = match rupnp::discover(&search_target, Duration::from_secs(3), None).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                log::error!("设备搜索启动失败: {}", e);
+                return Err(e);
             }
         };
 
+        // 使用与 check_rupnp 相同的收集方式
+        let devices: Vec<_> = devices_stream.collect().await;
+        log::info!("设备搜索完成，共找到 {} 个响应", devices.len());
+
         let mut dlna_devices = Vec::new();
+        let mut seen_locations: HashSet<String> = HashSet::new();
 
         for device_result in devices {
             match device_result {
                 Ok(device) => {
                     // 检查是否是媒体渲染器设备
                     let device_type_str = device.device_type().to_string();
+                    log::debug!("发现设备: {} (类型: {})", device.friendly_name(), device_type_str);
                     if device_type_str.contains("MediaRenderer") {
                         // 检查设备是否支持AVTransport服务
                         let supports_avtransport = device
@@ -375,6 +371,11 @@ impl DlnaController {
                         if supports_avtransport {
                             let friendly_name = device.friendly_name().to_string();
                             let location = device.url().to_string();
+
+                            if !seen_locations.insert(location.clone()) {
+                                log::debug!("设备已存在，跳过: {} ({})", friendly_name, location);
+                                continue;
+                            }
 
                             // 获取所有服务
                             let services: Vec<URN> = device
