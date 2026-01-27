@@ -123,6 +123,11 @@ async fn main() -> Result<()> {
     // 创建应用状态
     let mut app = TuiApp::new();
 
+    // 添加一个标志来表示正在设置媒体 URI
+    let is_setting_uri = Arc::new(Mutex::new(false));
+    // 添加一个标志来表示是否已经设置了Uri
+    let is_uri_set = Arc::new(Mutex::new(false));
+
     // 创建用于在任务间通信的通道
     let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -197,10 +202,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 Message::Error(err) => {
-                    let err_msg = err.clone();
+                    // 处理错误消息
                     app.update_state(AppState::Error(err));
-                    app.is_loading = false; // 确保在错误情况下也停止加载状态
-                    error!("设备搜索错误: {}", err_msg);
                 }
             }
         }
@@ -260,15 +263,23 @@ async fn main() -> Result<()> {
                         active_playlist_manager = Some(playlist_manager.clone());
                         let controller_clone = controller.clone();
                         let device = app.selected_device.as_ref().unwrap().clone();
+                        let is_setting_uri_clone = Arc::clone(&is_setting_uri);
+                        let is_uri_set_clone = Arc::clone(&is_uri_set);
 
                         // 启动播放列表更新
                         playlist_manager.start_periodic_update(move |url| {
                             let controller = controller_clone.clone();
                             let device = device.clone();
                             let tx = tx_clone.clone();
+                            let is_setting_uri = Arc::clone(&is_setting_uri_clone);
+                            let is_uri_set = Arc::clone(&is_uri_set_clone);
                             Box::pin(async move {
+                                // 设置正在设置媒体 URI 的标志
+                                *is_setting_uri.lock().await = true;
                                 // 播放URL
-                                play_url(&controller, &device, &url, tx).await;
+                                play_url(&controller, &device, &url, tx, is_uri_set).await;
+                                // 清除正在设置媒体 URI 的标志
+                                *is_setting_uri.lock().await = false;
                             })
                         });
 
@@ -278,7 +289,7 @@ async fn main() -> Result<()> {
                         let tx_clone = tx.clone();
                         let mut playlist_manager_for_monitor = playlist_manager.clone();
                         tokio::spawn(async move {
-                            let mut interval =
+                            let mut interval = 
                                 tokio::time::interval(std::time::Duration::from_secs(1));
                             let mut next_cooldown_until = std::time::Instant::now();
                             loop {
@@ -355,31 +366,26 @@ async fn main() -> Result<()> {
                 // 处理播放/暂停状态变化
                 if let AppState::Playing = app.state {
                     // 检查是否需要发送播放命令
-                    match controller.get_playback_state(device).await {
-                        Ok(state) if state != "PLAYING" => {
-                            // 发送播放命令
-                            if let Err(e) = controller.play(device).await {
-                                error!("发送播放命令失败: {}", e);
-                            }
+                    let uri_set = *is_uri_set.lock().await;
+                    if uri_set {
+                        // 发送播放命令
+                        info!("已设置Uri，准备发送播放指令");
+                        if let Err(e) = controller.play(device).await {
+                            error!("发送播放命令失败: {}", e);
                         }
-                        Err(e) => {
-                            error!("获取播放状态失败: {}", e);
-                        }
-                        _ => {} // 状态已经是PLAYING，无需操作
+                    } else {
+                        warn!("尚未设置Uri，跳过播放指令");
                     }
                 } else if let AppState::Paused = app.state {
                     // 检查是否需要发送暂停命令
-                    match controller.get_playback_state(device).await {
-                        Ok(state) if state == "PLAYING" => {
-                            // 发送暂停命令
-                            if let Err(e) = controller.pause(device).await {
-                                error!("发送暂停命令失败: {}", e);
-                            }
+                    let uri_set = *is_uri_set.lock().await;
+                    if uri_set {
+                        // 发送暂停命令
+                        if let Err(e) = controller.pause(device).await {
+                            error!("发送暂停命令失败: {}", e);
                         }
-                        Err(e) => {
-                            error!("获取播放状态失败: {}", e);
-                        }
-                        _ => {} // 状态已经是PAUSED或STOPPED，无需操作
+                    } else {
+                        warn!("尚未设置Uri，跳过暂停指令");
                     }
                 }
             }
@@ -427,6 +433,7 @@ async fn play_url(
     device: &dlna_controller::DlnaDevice,
     url: &str,
     _tx: mpsc::UnboundedSender<Message>,
+    is_uri_set: Arc<Mutex<bool>>,
 ) {
     use crate::bilibili_parser::get_bilibili_direct_link;
     use std::time::Duration;
@@ -478,6 +485,8 @@ async fn play_url(
         match controller.set_avtransport_uri(device, &url, "").await {
             Ok(_) => {
                 info!("成功设置AVTransport URI为 {}", url);
+                // 设置Uri成功后标记为true
+                *is_uri_set.lock().await = true;
                 break;
             }
             Err(e) => {
@@ -491,6 +500,8 @@ async fn play_url(
                 {
                     // 2xx错误码视为成功
                     info!("设置AVTransport URI返回错误码{}，视为成功", code);
+                    // 设置Uri成功后标记为true
+                    *is_uri_set.lock().await = true;
                     break;
                 }
 
@@ -500,7 +511,7 @@ async fn play_url(
         }
     }
 
-    // 重试play
+    // 直接发送play指令，不再检查播放状态
     loop {
         match controller.play(device).await {
             Ok(_) => {

@@ -260,6 +260,18 @@ async fn avtransport_action_compat(
                     log::debug!("UPnP Action (compat) status=200 body={}", text);
 
                     let mut out = HashMap::new();
+                    // 提取 GetTransportInfo 相关字段
+                    for k in [
+                        "CurrentTransportState",
+                        "CurrentTransportStatus",
+                        "CurrentSpeed",
+                    ] {
+                        if let Some(v) = extract_xml_tag_value(&text, k) {
+                            log::debug!("提取到字段 '{}' 的值: '{}'", k, v);
+                            out.insert(k.to_string(), v);
+                        }
+                    }
+                    // 提取 GetPositionInfo 相关字段
                     for k in [
                         "Track",
                         "TrackDuration",
