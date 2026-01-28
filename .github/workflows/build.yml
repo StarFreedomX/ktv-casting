@@ -5,14 +5,19 @@ permissions:
 
 on:
   push:
-    branches: [ "main" ]
-    tags: [ "v*" ]
+    # 允许 main 和 TUI 分支的 push 触发测试构建
+    branches: [ "main", "TUI" ]
+    # 监听两种 tag 格式：
+    # 1. v1.0.0 (主线)
+    # 2. tui-v0.1.0 (TUI分支)
+    tags: [ "v*", "tui-v*" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "TUI" ]
 
 env:
   CARGO_TERM_COLOR: always
-  BIN_NAME: ktv-casting
+  # 这是 Cargo.toml 里写的原始名字 (编译产出的名字)
+  CRATE_NAME: ktv-casting
 
 jobs:
   build-and-upload:
@@ -56,6 +61,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 🌟 新增步骤：根据 Tag 决定发布时的文件名和是否为预览版
+      - name: Determine Release Config
+        shell: bash
+        run: |
+          # 默认配置 (Master/Main)
+          FINAL_NAME="${{ env.CRATE_NAME }}"
+          IS_PRERELEASE="false"
+
+          # 检查当前 Tag 是否以 'tui-' 开头
+          if [[ "${{ github.ref }}" == *"refs/tags/tui-"* ]]; then
+            echo "Detecting TUI release..."
+            # 给发布的文件名加个 -tui 后缀，变成 ktv-casting-tui
+            FINAL_NAME="${{ env.CRATE_NAME }}-tui"
+            # 标记为预发布版本，GitHub UI 上会显示为 "Pre-release"
+            IS_PRERELEASE="true"
+          fi
+
+          # 导出环境变量供后续步骤使用
+          echo "FINAL_BIN_NAME=$FINAL_NAME" >> $GITHUB_ENV
+          echo "IS_PRERELEASE=$IS_PRERELEASE" >> $GITHUB_ENV
+          
+          echo "Build Mode: Name=$FINAL_NAME, Prerelease=$IS_PRERELEASE"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,11 +99,7 @@ jobs:
       - name: Build Binary
         shell: bash
         run: |
-          # 导出 RUSTFLAGS 环境变量
           export RUSTFLAGS="${{ matrix.platform.rustflags }}"
-          
-          echo "Building for ${{ matrix.platform.target }} with flags: $RUSTFLAGS"
-
           if [ "${{ matrix.platform.command }}" == "cross" ]; then
             cross build --release --target ${{ matrix.platform.target }}
           else
@@ -87,15 +111,18 @@ jobs:
         run: |
           mkdir -p dist
           
-          # 根据平台设置扩展名
+          # 处理 Windows 后缀
           if [ "${{ matrix.platform.os }}" == "windows-latest" ]; then
             EXT=".exe"
           else
             EXT=""
           fi
           
-          SRC="target/${{ matrix.platform.target }}/release/${{ env.BIN_NAME }}$EXT"
-          DST="dist/${{ env.BIN_NAME }}-${{ matrix.platform.target }}$EXT"
+          # SRC: 使用 Cargo.toml 里的原始名字 (CRATE_NAME)
+          SRC="target/${{ matrix.platform.target }}/release/${{ env.CRATE_NAME }}$EXT"
+          
+          # DST: 使用我们要发布的最终名字 (FINAL_BIN_NAME，可能包含 -tui)
+          DST="dist/${{ env.FINAL_BIN_NAME }}-${{ matrix.platform.target }}$EXT"
           
           echo "Moving $SRC to $DST"
           cp "$SRC" "$DST"
@@ -106,3 +133,5 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # 🌟 根据前面的判断，动态设置是否为 Pre-release
+          prerelease: ${{ env.IS_PRERELEASE }}
