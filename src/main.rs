@@ -62,8 +62,7 @@ async fn main() -> Result<()> {
     info!("Parsed room_id: {}", room_id);
 
     let server_port = 8080;
-    let playlist: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
-    let mut playlist_manager = PlaylistManager::new(&base_url, room_id, playlist.clone());
+    let mut playlist_manager = PlaylistManager::new(&base_url, room_id);
 
     let duration_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let shared_state = web::Data::new(SharedState {

@@ -11,17 +11,15 @@ pub struct PlaylistManager {
     url: String,
     room_id: String,
     hash: Arc<Mutex<Option<String>>>,
-    playlist: Arc<Mutex<Vec<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaylistManager {
-    pub fn new(url: &str, room_id: String, playlist: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(url: &str, room_id: String) -> Self {
         Self {
             url: url.to_string(),
             room_id,
             hash: Arc::new(Mutex::new(None)),
-            playlist,
             song_playing: Arc::new(Mutex::new(None)),
         }
     }
@@ -79,21 +77,6 @@ impl PlaylistManager {
             }
         };
 
-        // 从 list 数组中提取待播歌单 URL
-        let urls: Vec<String> = if let Some(list_array) = resp_json["list"].as_array() {
-            list_array
-                .iter()
-                .filter(|item| {
-                    item.get("state")
-                        .is_none_or(|s| s.as_str().unwrap_or("") != "sung")
-                })
-                .filter_map(|item| item["url"].as_str())
-                .map(extract_bv_function)
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         // 从 list 数组中提取最后一条状态为 “sung” 的歌单 URL
         let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
             list_array
@@ -109,18 +92,6 @@ impl PlaylistManager {
             None
         };
 
-        info!("获取到 {} 个URL，新的hash: {}", urls.len(), new_hash);
-
-        // 打印每个URL用于调试
-        for (i, url) in urls.iter().enumerate() {
-            debug!("  {}. {}", i + 1, url);
-        }
-
-        // 更新播放列表
-        let mut playlist = self.playlist.lock().await;
-        playlist.clear();
-        playlist.extend(urls);
-        drop(playlist); // 释放锁，避免长时间持有
 
         // 更新当前歌曲
         let mut song_playing = self.song_playing.lock().await;
@@ -200,9 +171,7 @@ impl PlaylistManager {
 async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== PlaylistManager 使用示例 ===");
 
-    let playlist = Arc::new(Mutex::new(Vec::<String>::new()));
-
-    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string(), playlist.clone());
+    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string());
 
     println!("开始获取播放列表...");
 
@@ -210,14 +179,14 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     match manager.fetch_playlist().await {
         Ok(_) => {
             println!("✓ 成功获取播放列表");
-            // 【关键点 1】：用大括号包裹锁的使用
+            // 获取当前播放的歌曲
             {
-                let playlist_lock = playlist.lock().await;
-                println!("播放列表内容 ({} 个项目):", playlist_lock.len());
-                for (i, url) in playlist_lock.iter().enumerate() {
-                    println!("  {}. {}", i + 1, url);
+                let song_playing = manager.get_song_playing().await;
+                match &song_playing {
+                    Some(url) => println!("当前播放的歌曲: {}", url),
+                    None => println!("当前没有播放的歌曲"),
                 }
-            } // <--- 锁在这里被强制释放 (DROP)
+            }
         }
         Err(e) => error!("✗ 获取播放列表失败: {}", e),
     }
@@ -226,13 +195,14 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
     manager.next_song().await?;
     println!("请求下一首歌曲后播放列表状态:");
 
-    // 【关键点 2】：再次用大括号包裹锁
+    // 获取当前播放的歌曲
     {
-        let playlist_lock = playlist.lock().await;
-        for (i, url) in playlist_lock.iter().enumerate() {
-            println!("  {}. {}", i + 1, url);
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
         }
-    } // <--- 锁在这里被强制释放 (DROP)
+    }
 
     // --- 后台任务开始 ---
     manager.start_periodic_update(|url: String| {
@@ -246,11 +216,12 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("5秒后播放列表状态:");
 
-    // 【关键点 4】：休眠结束后，再次获取锁查看结果
+    // 获取当前播放的歌曲
     {
-        let playlist_lock = playlist.lock().await;
-        for (i, url) in playlist_lock.iter().enumerate() {
-            println!("  {}. {}", i + 1, url);
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
         }
     }
 
