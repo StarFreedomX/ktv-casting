@@ -58,9 +58,7 @@ async fn main() -> Result<()> {
     }
 
     let room_str = segments.last().unwrap();
-    let room_id: u64 = room_str
-        .parse::<u64>()
-        .with_context(|| format!("Error parsing room_str {}", room_str))?;
+    let room_id: String = room_str.to_string();
     info!("Parsed room_id: {}", room_id);
 
     let server_port = 8080;
