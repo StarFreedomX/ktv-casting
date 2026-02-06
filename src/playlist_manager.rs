@@ -1,38 +1,339 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, Interval};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use futures_util::{SinkExt, StreamExt};
+use crate::utils::extract_bv_id;
+
 #[derive(Clone)]
 pub struct PlaylistManager {
     url: String,
     room_id: String,
+    nickname: String,
     hash: Arc<Mutex<Option<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
+    on_song_change: Arc<Mutex<Option<Arc<dyn Fn(String) + Send + Sync>>>>,
+    client: Client,
 }
 
 impl PlaylistManager {
-    pub fn new(url: &str, room_id: String) -> Self {
-        Self {
-            url: url.to_string(),
-            room_id,
-            hash: Arc::new(Mutex::new(None)),
-            song_playing: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    async fn fetch_playlist(&mut self) -> Result<Option<String>, String> {
+    pub fn new(url: &str, room_id: String, nickname: Option<String>) -> Self {
         let client = Client::builder()
             .use_rustls_tls()
             .build()
-            .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+            .expect("Failed to create HTTP client");
+        
+        Self {
+            url: url.to_string(),
+            room_id,
+            nickname: nickname.unwrap_or_else(|| "ktv-casting".to_string()),
+            hash: Arc::new(Mutex::new(None)),
+            song_playing: Arc::new(Mutex::new(None)),
+            on_song_change: Arc::new(Mutex::new(None)),
+            client,
+        }
+    }
 
+    /// 设置歌曲变化回调函数（异步版本）
+    pub async fn set_on_song_change<F>(&self, callback: F)
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        let mut on_song_change = self.on_song_change.lock().await;
+        *on_song_change = Some(Arc::new(callback));
+    }
+
+    /// 启动WebSocket连接并监听（包含自动重连）
+    pub async fn start_websocket_listener(self: Arc<Self>) -> Result<(), String> {
+        let mut backoff = 1;
+        
+        loop {
+            match Arc::clone(&self).connect_websocket_internal().await {
+                Ok(_) => {
+                    info!("WebSocket连接成功");
+                    backoff = 1; // 重置退避
+                }
+                Err(e) => {
+                    warn!("WebSocket连接失败: {}，{}秒后重试", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60); // 指数退避，最大60秒
+                    continue;
+                }
+            }
+
+            // 连接成功后，等待断开后再重连
+            break;
+        }
+
+        Ok(())
+    }
+
+    /// 内部连接方法（不包含重连逻辑）
+    async fn connect_websocket_internal(self: Arc<Self>) -> Result<(), String> {
+        // 从HTTP URL构建WebSocket URL
+        // 例如：https://ktv.starfreedomx.top -> wss://ktv.starfreedomx.top
+        let ws_protocol = if self.url.starts_with("https://") { "wss:" } else { "ws:" };
+        
+        // 提取主机部分（去除协议）
+        let host_part = if self.url.starts_with("http://") {
+            &self.url[7..] // 跳过 "http://"
+        } else if self.url.starts_with("https://") {
+            &self.url[8..] // 跳过 "https://"
+        } else {
+            &self.url
+        };
+        
+        let ws_url = format!("{}//{}/api/ws?roomId={}&nickname={}", 
+            ws_protocol, 
+            host_part, 
+            self.room_id,
+            urlencoding::encode(&self.nickname)
+        );
+        
+        info!("正在连接到WebSocket: {}", ws_url);
+
+        let (ws_stream, _) = connect_async(&ws_url)
+            .await
+            .map_err(|e| format!("WebSocket连接失败: {}", e))?;
+
+        info!("WebSocket连接成功，开始监听消息...");
+
+        // 启动消息监听任务
+        tokio::spawn(async move {
+            Self::message_listener(self, ws_stream).await;
+        });
+
+        Ok(())
+    }
+
+    /// 消息监听循环
+    async fn message_listener(
+        self: Arc<Self>,
+        mut ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ) {
+        let mut ping_interval: Interval = tokio::time::interval(Duration::from_secs(30));
+        let mut last_pong_time = std::time::Instant::now();
+
+        loop {
+            tokio::select! {
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            debug!("收到WebSocket消息: {}", text);
+                            
+                            // 处理心跳响应
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+                                && json.get("type").and_then(|t| t.as_str()) == Some("pong") {
+                                    last_pong_time = std::time::Instant::now();
+                                    debug!("收到pong响应");
+                                    continue;
+                                }
+
+                            // 处理UPDATE消息
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+                                && let Some(msg_type) = json.get("type").and_then(|t| t.as_str())
+                                    && msg_type == "UPDATE"
+                                        && let Some(hash) = json.get("hash").and_then(|h| h.as_str()) {
+                                            self.handle_update(hash.to_string()).await;
+                                        }
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            debug!("收到ping，发送pong");
+                            if ws_stream.send(Message::Pong(data)).await.is_err() {
+                                warn!("发送pong失败");
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            last_pong_time = std::time::Instant::now();
+                            debug!("收到pong");
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("WebSocket连接已关闭");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            warn!("WebSocket错误: {}", e);
+                            break;
+                        }
+                        None => {
+                            info!("WebSocket流结束");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    // 定时发送ping并检查连接状态
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_pong_time) > Duration::from_secs(60) {
+                        warn!("超过60秒未收到pong，连接可能已断开");
+                        break;
+                    }
+
+                    if ws_stream.send(Message::Ping(vec![])).await.is_err() {
+                        warn!("发送ping失败，连接可能已断开");
+                        break;
+                    }
+                    debug!("发送ping");
+                }
+            }
+        }
+
+        info!("WebSocket监听结束");
+    }
+
+    /// 处理UPDATE消息
+    async fn handle_update(&self, new_hash: String) {
+        let mut hash_guard = self.hash.lock().await;
+        let old_hash = hash_guard.clone();
+        *hash_guard = Some(new_hash.clone());
+        drop(hash_guard);
+
+        // 如果hash发生变化，获取当前播放的歌曲
+        if old_hash != Some(new_hash.clone()) {
+            info!("检测到歌单更新，hash: {}", new_hash);
+            
+            // 调用HTTP接口获取完整歌单信息
+            if let Ok(Some(song_url)) = self.fetch_current_song_from_hash(&new_hash).await {
+                let mut song_playing = self.song_playing.lock().await;
+                let old_song = song_playing.clone();
+                *song_playing = Some(song_url.clone());
+                drop(song_playing);
+
+                if old_song != Some(song_url.clone()) {
+                    info!("歌曲已切换为: {}", song_url);
+                    if let Some(callback) = self.on_song_change.lock().await.as_ref() {
+                        callback(song_url);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 根据hash获取当前播放的歌曲（通过HTTP接口）
+    async fn fetch_current_song_from_hash(&self, hash: &str) -> Result<Option<String>, String> {
+        let url = format!(
+            "{}/api/songListInfo?roomId={}&lastHash={}",
+            self.url, self.room_id, hash
+        );
+
+        debug!("获取当前歌曲: {}", url);
+
+        let resp = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("发送请求失败: {}", e))?;
+        
+        if !resp.status().is_success() {
+            return Err(format!("请求失败，状态码: {}", resp.status()));
+        }
+
+        let resp_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析JSON失败: {}", e))?;
+
+        if !resp_json["changed"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+
+        // 提取正在演唱的歌曲
+        let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
+            list_array
+                .iter()
+                .rev()
+                .find(|item| {
+                    item.get("state")
+                        .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
+                })
+                .and_then(|item| item["url"].as_str())
+                .map(extract_bv_id)
+        } else {
+            None
+        };
+
+        Ok(sung_url)
+    }
+
+    /// 请求下一首歌曲（HTTP接口）
+    pub async fn next_song(&self) -> Result<(), String> {
+        let url = format!("{}/api/nextSong?roomId={}", self.url, self.room_id);
+        let temp_hash = self
+            .hash
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
+        
+        let resp = self.client
+            .post(&url)
+            .json(&json!({"idArrayHash": temp_hash}))
+            .send()
+            .await
+            .map_err(|e| format!("发送请求失败: {}", e))?;
+        
+        let resp_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析JSON失败: {}", e))?;
+
+        if !resp_json["success"].as_bool().unwrap_or(false) {
+            return Err(format!("请求失败: {}", resp_json));
+        }
+
+        info!("成功请求下一首歌曲");
+        Ok(())
+    }
+
+    /// 获取当前播放的歌曲
+    pub async fn get_song_playing(&self) -> Option<String> {
+        self.song_playing.lock().await.clone()
+    }
+
+    /// 获取当前hash
+    pub async fn get_hash(&self) -> Option<String> {
+        self.hash.lock().await.clone()
+    }
+
+    /// 遗留的轮询方法（当WebSocket不可用时使用）
+    pub fn start_periodic_update_legacy<F>(&self, f_on_update: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+            let mut song_playing: Option<String> = None;
+            loop {
+                interval.tick().await;
+                match self_clone.fetch_playlist().await {
+                    Err(e) => error!("定时更新播放列表失败: {}", e),
+                    Ok(song_playing_new) => {
+                        if song_playing_new != song_playing {
+                            if let Some(url) = song_playing_new.clone() {
+                                f_on_update(url).await;
+                            }
+                            song_playing = song_playing_new;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 旧的fetch_playlist方法（用于轮询模式）
+    async fn fetch_playlist(&self) -> Result<Option<String>, String> {
         let hash_guard = self.hash.lock().await;
         let last_hash = hash_guard.clone().unwrap_or("EMPTY_LIST_HASH".to_string());
-        drop(hash_guard); // 释放锁，避免长时间持有
+        drop(hash_guard);
 
         let url = format!(
             "{}/api/songListInfo?roomId={}&lastHash={}",
@@ -41,7 +342,7 @@ impl PlaylistManager {
 
         debug!("正在获取播放列表: {}", url);
 
-        let resp = client
+        let resp = self.client
             .get(&url)
             .send()
             .await
@@ -67,31 +368,19 @@ impl PlaylistManager {
             .unwrap_or("EMPTY_LIST_HASH")
             .to_string();
 
-        let extract_bv_function = |url: &str| {
-            // 提取 bilibili://video/ 后面的部分
-            if let Some(start) = url.find("bilibili://video/") {
-                let after_prefix = &url[start + "bilibili://video/".len()..];
-                after_prefix.to_string().replace("?", "-").replace("=", "") // 替换问号和等号，避免DLNA设备不支持
+        // 从 list 对象中提取 sung 数组的最后一项作为当前播放的歌曲
+        let sung_url: Option<String> = if let Some(list_obj) = resp_json["list"].as_object() {
+            if let Some(sung_array) = list_obj.get("sung").and_then(|s| s.as_array()) {
+                sung_array
+                    .last()
+                    .and_then(|item| item["url"].as_str())
+                    .map(extract_bv_id)
             } else {
-                url.to_string().replace("?", "-").replace("=", "")
+                None
             }
-        };
-
-        // 从 list 数组中提取最后一条状态为 “sung” 的歌单 URL
-        let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
-            list_array
-                .iter()
-                .rev() // 反转迭代器，从后往前找
-                .find(|item| {
-                    item.get("state")
-                        .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
-                })
-                .and_then(|item| item["url"].as_str()) // 把 &str 转为 Option<&str>
-                .map(extract_bv_function) // 如果你需要把 url 处理成 bv 等
         } else {
             None
         };
-
 
         // 更新当前歌曲
         let mut song_playing = self.song_playing.lock().await;
@@ -101,130 +390,9 @@ impl PlaylistManager {
         // 更新 hash 值
         let mut hash = self.hash.lock().await;
         *hash = Some(new_hash);
-        drop(hash); // 释放锁
+        drop(hash);
 
         Ok(sung_url)
     }
-
-    pub fn start_periodic_update<F>(&self, f_on_update: F)
-    where
-        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
-    {
-        let mut self_clone = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-            let mut song_playing: Option<String> = None;
-            loop {
-                interval.tick().await;
-                match self_clone.fetch_playlist().await {
-                    Err(e) => error!("定时更新播放列表失败: {}", e),
-                    Ok(song_playing_new) => {
-                        if song_playing_new != song_playing {
-                            if let Some(url) = song_playing_new.clone() {
-                                f_on_update(url).await; // await the future
-                            }
-                            song_playing = song_playing_new;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    pub async fn next_song(&mut self) -> Result<(), String> {
-        let url = format!("{}/api/nextSong?roomId={}", self.url, self.room_id);
-        let temp_hash = self
-            .hash
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
-        let client = Client::builder()
-            .use_rustls_tls()
-            .build()
-            .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
-        let resp = client
-            .post(&url)
-            .json(&json!({"idArrayHash": temp_hash}))
-            .send()
-            .await
-            .map_err(|e| format!("发送请求失败: {}", e))?;
-        let resp_json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("解析JSON失败: {}", e))?;
-
-        if !resp_json["success"].as_bool().unwrap_or(false) {
-            return Err(format!("请求失败: {}", resp_json));
-        }
-        self.fetch_playlist().await?;
-
-        Ok(())
-    }
-
-    pub async fn get_song_playing(&self) -> Option<String> {
-        self.song_playing.lock().await.clone()
-    }
 }
 
-#[tokio::test]
-async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== PlaylistManager 使用示例 ===");
-
-    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string());
-
-    println!("开始获取播放列表...");
-
-    // --- 第一次操作 ---
-    match manager.fetch_playlist().await {
-        Ok(_) => {
-            println!("✓ 成功获取播放列表");
-            // 获取当前播放的歌曲
-            {
-                let song_playing = manager.get_song_playing().await;
-                match &song_playing {
-                    Some(url) => println!("当前播放的歌曲: {}", url),
-                    None => println!("当前没有播放的歌曲"),
-                }
-            }
-        }
-        Err(e) => error!("✗ 获取播放列表失败: {}", e),
-    }
-
-    // --- 第二次操作 ---
-    manager.next_song().await?;
-    println!("请求下一首歌曲后播放列表状态:");
-
-    // 获取当前播放的歌曲
-    {
-        let song_playing = manager.get_song_playing().await;
-        match &song_playing {
-            Some(url) => println!("当前播放的歌曲: {}", url),
-            None => println!("当前没有播放的歌曲"),
-        }
-    }
-
-    // --- 后台任务开始 ---
-    manager.start_periodic_update(|url: String| {
-        println!("Song singing changed to {}!", url);
-        Box::pin(async {})
-    });
-
-    // 【关键点 3】：sleep 必须在“裸奔”状态下运行（不持有任何锁）
-    // 此时 playlist 锁是空闲的，后台线程的 fetch_playlist 才能拿到锁并更新数据
-    sleep(Duration::from_secs(5)).await;
-
-    println!("5秒后播放列表状态:");
-
-    // 获取当前播放的歌曲
-    {
-        let song_playing = manager.get_song_playing().await;
-        match &song_playing {
-            Some(url) => println!("当前播放的歌曲: {}", url),
-            None => println!("当前没有播放的歌曲"),
-        }
-    }
-
-    println!("=== 示例结束 ===");
-    Ok(())
-}

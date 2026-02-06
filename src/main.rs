@@ -2,7 +2,7 @@ use crate::dlna_controller::DlnaController;
 use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, bail};
 use local_ip_address::local_ip;
-use log::{error, info, warn};
+use log::{error, info};
 use playlist_manager::PlaylistManager;
 use reqwest::Client;
 use std::io;
@@ -11,12 +11,14 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use url::{Position, Url};
+use crate::utils::retry_until_success;
 
 mod bilibili_parser;
 mod dlna_controller;
 mod media_server;
 mod mp4_util;
 mod playlist_manager;
+mod utils;
 
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
@@ -61,8 +63,15 @@ async fn main() -> Result<()> {
     let room_id: String = room_str.to_string();
     info!("Parsed room_id: {}", room_id);
 
+    // 询问用户昵称（可选）
+    println!("输入您的昵称（直接回车使用默认值 'ktv-casting'）：");
+    input.clear();
+    io::stdin().read_line(&mut input).expect("无法读取输入");
+    let nickname = input.trim().to_string();
+    let nickname = if nickname.is_empty() { None } else { Some(nickname) };
+
     let server_port = 8080;
-    let mut playlist_manager = PlaylistManager::new(&base_url, room_id);
+    let playlist_manager = Arc::new(PlaylistManager::new(&base_url, room_id.clone(), nickname.clone()));
 
     let duration_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let shared_state = web::Data::new(SharedState {
@@ -107,141 +116,71 @@ async fn main() -> Result<()> {
     }
     let device = devices[device_num].clone(); // clone owned copy
     let device_cloned = device.clone();
-    playlist_manager.start_periodic_update(move |url| {
-        let controller = controller.clone();
-        let device = device.clone();
-        Box::pin(async move {
-            loop {
-                match controller.stop(&device).await {
-                    Ok(_) => {
-                        info!("成功停止播放");
-                        break;
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        let error_code: Option<u32> = error_msg
-                            .split(|c: char| !c.is_numeric())
-                            .find(|s| s.len() == 3)
-                            .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code
-                            && code / 100 == 2
-                        {
-                            // 2xx错误码视为成功
-                            info!("停止播放返回错误码{}，视为成功", code);
-                            break;
-                        }
 
-                        warn!("停止播放失败: {}，500ms后重试", error_msg);
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-
-            loop {
-                match controller
-                    .set_avtransport_uri(&device, &url, "", local_ip, server_port)
-                    .await
-                {
-                    Ok(_) => {
-                        info!("成功设置AVTransport URI为 {}", url);
-                        break;
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        let error_code: Option<u32> = error_msg
-                            .split(|c: char| !c.is_numeric())
-                            .find(|s| s.len() == 3)
-                            .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code
-                            && code / 100 == 2
-                        {
-                            // 2xx错误码视为成功
-                            info!("设置AVTransport URI返回错误码{}，视为成功", code);
-                            break;
-                        }
-
-                        warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-            // // 重试设置AVTransport URI
-            // loop {
-            //     match controller
-            //         .set_next_avtransport_uri(&device, &url, "", local_ip, server_port)
-            //         .await
-            //     {
-            //         Ok(_) => break,
-            //         Err(e) => {
-            //             let error_msg = format!("{}", e);
-            //             let error_code: Option<u32> = error_msg
-            //                 .split(|c: char| !c.is_numeric())
-            //                 .find(|s| s.len() == 3)
-            //                 .and_then(|s| s.parse().ok());
-            //             if let Some(code) = error_code {
-            //                 if code / 100 == 2 {
-            //                     // 2xx错误码视为成功
-            //                     info!("设置AVTransport URI返回错误码{}，视为成功", code);
-            //                     break
-            //                 }
-            //             }
-            //             warn!("设置AVTransport URI失败: {}，500ms后重试", error_msg);
-            //             sleep(Duration::from_millis(500)).await;
-            //         }
-            //     }
-            // }
-
-            // // 重试next
-            // loop {
-            //     match controller.next(&device).await {
-            //         Ok(_) => break,
-            //         Err(e) => {
-            //             let error_msg = format!("{}", e);
-            //             let error_code: Option<u32> = error_msg
-            //                 .split(|c: char| !c.is_numeric())
-            //                 .find(|s| s.len() == 3)
-            //                 .and_then(|s| s.parse().ok());
-            //             if let Some(code) = error_code {
-            //                 if code / 100 == 2 {
-            //                     // 2xx错误码视为成功
-            //                     info!("设置AVTransport URI返回错误码{}，视为成功", code);
-            //                     break;
-            //                 }
-            //             }
-            //             warn!("next失败: {}，500ms后重试", error_msg);
-            //             sleep(Duration::from_millis(500)).await;
-            //         }
-            //     }
-            // }
-
-            // 重试play
-            loop {
-                match controller.play(&device).await {
-                    Ok(_) => {
-                        info!("成功开始播放");
-                        break;
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        let error_code: Option<u32> = error_msg
-                            .split(|c: char| !c.is_numeric())
-                            .find(|s| s.len() == 3)
-                            .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code
-                            && code / 100 == 2
-                        {
-                            // 2xx错误码视为成功
-                            info!("播放返回错误码{}，视为成功", code);
-                            break;
-                        }
-
-                        warn!("play失败: {}，500ms后重试", error_msg);
-                        sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-        })
+    // 设置歌曲变化回调（需要克隆controller和device）
+    let controller_for_callback = controller.clone();
+    let device_for_callback = device.clone();
+    let callback_pm = PlaylistManager::new(&base_url, room_id.clone(), nickname.clone());
+    tokio::spawn(async move {
+        callback_pm.set_on_song_change(move |url| {
+            let controller = controller_for_callback.clone();
+            let device = device_for_callback.clone();
+            tokio::spawn(async move {
+                // 停止当前播放
+                retry_until_success("停止播放", 500, || async {
+                    controller.stop(&device).await.map_err(|e| e.to_string())
+                }).await.ok();
+                
+                // 设置AVTransport URI
+                retry_until_success("设置AVTransport URI", 500, || async {
+                    controller
+                        .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                        .await
+                        .map_err(|e| e.to_string())
+                }).await.ok();
+                
+                // 播放
+                retry_until_success("播放", 500, || async {
+                    controller.play(&device).await.map_err(|e| e.to_string())
+                }).await.ok();
+            });
+        }).await;
     });
+
+    // 启动WebSocket监听（需要克隆playlist_manager）
+    let pm_ws = playlist_manager.clone();
+    match pm_ws.start_websocket_listener().await {
+        Ok(_) => info!("WebSocket监听已启动"),
+        Err(e) => {
+            error!("WebSocket连接失败: {}，将退回到轮询模式", e);
+            // 如果WebSocket连接失败，退回到轮询模式
+            let controller_for_poll = controller.clone();
+            let device_for_poll = device.clone();
+            playlist_manager.start_periodic_update_legacy(move |url| {
+                let controller = controller_for_poll.clone();
+                let device = device_for_poll.clone();
+                Box::pin(async move {
+                    // 停止当前播放
+                    retry_until_success("停止播放", 500, || async {
+                        controller.stop(&device).await.map_err(|e| e.to_string())
+                    }).await.ok();
+                    
+                    // 设置AVTransport URI
+                    retry_until_success("设置AVTransport URI", 500, || async {
+                        controller
+                            .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }).await.ok();
+                    
+                    // 播放
+                    retry_until_success("播放", 500, || async {
+                        controller.play(&device).await.map_err(|e| e.to_string())
+                    }).await.ok();
+                })
+            });
+        }
+    }
 
     tokio::spawn(async move {
         let controller = DlnaController::new();
@@ -260,66 +199,42 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // 重试get_secs
-            loop {
-                match controller.get_secs(&device_cloned).await {
-                    Ok(result) => {
-                        (current_secs, _) = result;
+            // 使用重试逻辑获取播放进度
+            let result = retry_until_success("获取播放进度", 500, || async {
+                controller.get_secs(&device_cloned).await.map_err(|e| e.to_string())
+            }).await;
 
-                        // 如果从缓存拿到了长度，
-                        if cached_total > 0 {
-                            total_secs = cached_total;
-                            info!("使用缓存的视频时长: {}s", total_secs);
-                        }
+            match result {
+                Ok((current, _)) => {
+                    current_secs = current;
 
-                        let remaining_secs = if total_secs > current_secs {
-                            total_secs - current_secs
-                        } else {
-                            0
-                        };
+                    // 如果从缓存拿到了长度，
+                    if cached_total > 0 {
+                        total_secs = cached_total;
+                        info!("使用缓存的视频时长: {}s", total_secs);
+                    }
 
+                    let remaining_secs = total_secs.saturating_sub(current_secs);
+
+                    info!(
+                        "获取播放进度成功，当前时间{}秒，总时间{}秒，剩余时间{}秒",
+                        current_secs, total_secs, remaining_secs
+                    );
+
+                    if remaining_secs <= 2 && total_secs > 0 {
                         info!(
-                            "获取播放进度成功，当前时间{}秒，总时间{}秒，剩余时间{}秒",
-                            current_secs, total_secs, remaining_secs
+                            "剩余时间{}秒，总时间{}秒，准备切歌",
+                            remaining_secs, total_secs
                         );
-
-                        if remaining_secs <= 2 && total_secs > 0 {
-                            info!(
-                                "剩余时间{}秒，总时间{}秒，准备切歌",
-                                remaining_secs, total_secs
-                            );
-                            // 重试next_song
-                            loop {
-                                match playlist_manager.next_song().await {
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        let error_msg = e.to_string();
-                                        error!("next_song失败: {}，500ms后重试", error_msg);
-                                        sleep(Duration::from_millis(500)).await;
-                                    }
-                                }
-                            }
-                            sleep(Duration::from_secs(5)).await;
-                        }
-                        break;
+                        // 重试next_song
+                        retry_until_success("下一首歌曲", 500, || async {
+                            playlist_manager.next_song().await.map_err(|e| e.to_string())
+                        }).await.ok();
+                        sleep(Duration::from_secs(5)).await;
                     }
-                    Err(e) => {
-                        let error_msg = format!("{}", e);
-                        let error_code: Option<u32> = error_msg
-                            .split(|c: char| !c.is_numeric())
-                            .find(|s| s.len() == 3)
-                            .and_then(|s| s.parse().ok());
-                        if let Some(code) = error_code
-                            && code / 100 == 2
-                        {
-                            // 2xx错误码视为成功
-                            info!("获取进度返回错误码{}，视为成功", code);
-                            break;
-                        }
-
-                        warn!("get_secs失败: {}，500ms后重试", error_msg);
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                }
+                Err(e) => {
+                    error!("获取播放进度失败: {}", e);
                 }
             }
         }
