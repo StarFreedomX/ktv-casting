@@ -32,6 +32,7 @@ pub struct EngineContext {
 
 pub struct SharedState {
     pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    pub eplus_auth: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 // --- 辅助工具函数 ---
@@ -72,7 +73,15 @@ pub async fn get_current_progress() -> (i32, i32) {
     if let Ok(guard) = ENGINE_STATE.read() {
         if let Some(ctx) = guard.as_ref() {
             return match ctx.controller.get_secs(&ctx.device).await {
-                Ok((curr, total)) => (curr as i32, total as i32),
+                Ok((curr, total)) => {
+                    let cached_total=get_total_duration().await;
+                    if cached_total > 0 && cached_total != total {
+                        (curr as i32, cached_total as i32)
+                    }else{
+                        (curr as i32, total as i32)
+                    }
+                    
+                }
                 Err(_) => (-1 , -1),
             };
         }
@@ -153,6 +162,7 @@ pub async fn start_engine_core(
 
     let shared_state = web::Data::new(SharedState {
         duration_cache: cache.clone(),
+        eplus_auth: Arc::new(tokio::sync::Mutex::new(None)),
     });
     let port = 8080u16;
 
