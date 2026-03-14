@@ -1,3 +1,5 @@
+use crate::utils::extract_bv_id;
+use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde_json::json;
@@ -5,11 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Interval};
+use tokio::time::{Interval, sleep};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use futures_util::{SinkExt, StreamExt};
-use crate::utils::extract_bv_id;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 #[derive(Clone)]
 pub struct PlaylistManager {
@@ -28,7 +28,7 @@ impl PlaylistManager {
             .use_rustls_tls()
             .build()
             .expect("Failed to create HTTP client");
-        
+
         Self {
             url: url.to_string(),
             room_id,
@@ -52,7 +52,7 @@ impl PlaylistManager {
     /// 启动WebSocket连接并监听（包含自动重连）
     pub async fn start_websocket_listener(self: Arc<Self>) -> Result<(), String> {
         let mut backoff = 1;
-        
+
         loop {
             match Arc::clone(&self).connect_websocket_internal().await {
                 Ok(_) => {
@@ -78,8 +78,12 @@ impl PlaylistManager {
     async fn connect_websocket_internal(self: Arc<Self>) -> Result<(), String> {
         // 从HTTP URL构建WebSocket URL
         // 例如：https://ktv.starfreedomx.top -> wss://ktv.starfreedomx.top
-        let ws_protocol = if self.url.starts_with("https://") { "wss:" } else { "ws:" };
-        
+        let ws_protocol = if self.url.starts_with("https://") {
+            "wss:"
+        } else {
+            "ws:"
+        };
+
         // 提取主机部分（去除协议）
         let host_part = if self.url.starts_with("http://") {
             &self.url[7..] // 跳过 "http://"
@@ -88,21 +92,27 @@ impl PlaylistManager {
         } else {
             &self.url
         };
-        
-        let ws_url = format!("{}//{}/api/ws?roomId={}&nickname={}", 
-            ws_protocol, 
-            host_part, 
+
+        let ws_url = format!(
+            "{}//{}/api/ws?roomId={}&nickname={}",
+            ws_protocol,
+            host_part,
             self.room_id,
             urlencoding::encode(&self.nickname)
         );
-        
+
         info!("正在连接到WebSocket: {}", ws_url);
 
         let (ws_stream, _) = connect_async(&ws_url)
             .await
             .map_err(|e| format!("WebSocket连接失败: {}", e))?;
 
-        info!("WebSocket连接成功，开始监听消息...");
+        info!("WebSocket连接成功，获取初始歌曲状态...");
+
+        // 获取初始歌曲状态（如果有歌曲正在播放，立即投屏）
+        self.fetch_initial_state().await;
+
+        info!("开始监听消息...");
 
         // 启动消息监听任务
         tokio::spawn(async move {
@@ -110,6 +120,77 @@ impl PlaylistManager {
         });
 
         Ok(())
+    }
+
+    /// 获取初始歌曲状态（用于WebSocket连接成功后立即获取当前播放的歌曲）
+    async fn fetch_initial_state(&self) {
+        // 使用空hash获取当前歌曲状态
+        let empty_hash = "";
+        
+        let url = format!(
+            "{}/api/songListInfo?roomId={}&lastHash={}",
+            self.url, self.room_id, empty_hash
+        );
+
+        info!("获取初始歌曲状态: {}", url);
+
+        let resp = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("获取初始歌曲状态失败: {}", e);
+                return;
+            }
+        };
+
+        if !resp.status().is_success() {
+            error!("获取初始歌曲状态失败，状态码: {}", resp.status());
+            return;
+        }
+
+        let resp_json: serde_json::Value = match resp.json().await {
+            Ok(json) => json,
+            Err(e) => {
+                error!("解析初始歌曲状态JSON失败: {}", e);
+                return;
+            }
+        };
+
+        // 获取 hash 值
+        let new_hash = resp_json["hash"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // 提取正在演唱的歌曲
+        let sung_url: Option<String> = if let Some(singing_obj) = resp_json["list"]["singing"].as_object() {
+            singing_obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(extract_bv_id)
+        } else {
+            None
+        };
+
+        // 更新 hash 值
+        let mut hash_guard = self.hash.lock().await;
+        *hash_guard = Some(new_hash.clone());
+        drop(hash_guard);
+
+        // 如果有歌曲正在播放，触发回调
+        if let Some(song_url) = sung_url {
+            info!("初始歌曲状态: {}", song_url);
+            
+            let mut song_playing = self.song_playing.lock().await;
+            *song_playing = Some(song_url.clone());
+            drop(song_playing);
+
+            // 触发回调进行投屏
+            if let Some(callback) = self.on_song_change.lock().await.as_ref() {
+                callback(song_url);
+            }
+        } else {
+            info!("当前没有正在演唱的歌曲");
+        }
     }
 
     /// 消息监听循环
@@ -125,16 +206,6 @@ impl PlaylistManager {
                 msg = ws_stream.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            debug!("收到WebSocket消息: {}", text);
-                            
-                            // 处理心跳响应
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-                                && json.get("type").and_then(|t| t.as_str()) == Some("pong") {
-                                    last_pong_time = std::time::Instant::now();
-                                    debug!("收到pong响应");
-                                    continue;
-                                }
-
                             // 处理UPDATE消息
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
                                 && let Some(msg_type) = json.get("type").and_then(|t| t.as_str())
@@ -166,7 +237,10 @@ impl PlaylistManager {
                             info!("WebSocket流结束");
                             break;
                         }
-                        _ => {}
+                        _ => {
+                            // 其他消息类型（如Binary）可以忽略或记录
+                            debug!("收到非文本消息，类型: {:?}", msg);
+                        }
                     }
                 }
                 _ = ping_interval.tick() => {
@@ -191,30 +265,36 @@ impl PlaylistManager {
 
     /// 处理UPDATE消息
     async fn handle_update(&self, new_hash: String) {
-        let mut hash_guard = self.hash.lock().await;
+        let hash_guard = self.hash.lock().await;
         let old_hash = hash_guard.clone();
-        *hash_guard = Some(new_hash.clone());
         drop(hash_guard);
 
-        // 如果hash发生变化，获取当前播放的歌曲
+        // 如果hash发生变化，使用old_hash获取当前播放的歌曲，否则可能会因为hash已经更新而无法正确获取当前歌曲信息
         if old_hash != Some(new_hash.clone()) {
-            info!("检测到歌单更新，hash: {}", new_hash);
-            
-            // 调用HTTP接口获取完整歌单信息
-            if let Ok(Some(song_url)) = self.fetch_current_song_from_hash(&new_hash).await {
+            info!("检测到歌单更新，old_hash: {:?} -> new_hash: {}", old_hash, new_hash);
+
+            // 调用HTTP接口获取完整歌单信息（使用old_hash）
+            if let Ok(song_url) = self.fetch_current_song_from_hash(old_hash.as_deref().unwrap_or("")).await {
+                debug!("当前播放的歌曲URL: {:?}", song_url);
                 let mut song_playing = self.song_playing.lock().await;
                 let old_song = song_playing.clone();
-                *song_playing = Some(song_url.clone());
+                *song_playing = song_url.clone();
                 drop(song_playing);
 
-                if old_song != Some(song_url.clone()) {
-                    info!("歌曲已切换为: {}", song_url);
-                    if let Some(callback) = self.on_song_change.lock().await.as_ref() {
-                        callback(song_url);
+                if old_song != song_url {
+                    if let Some(song_url) = song_url {
+                        info!("歌曲已切换为: {}", song_url);
+                        if let Some(callback) = self.on_song_change.lock().await.as_ref() {
+                            callback(song_url);
+                        }
                     }
                 }
             }
         }
+
+        // 更新hash值
+        let mut hash_guard = self.hash.lock().await;
+        *hash_guard = Some(new_hash);
     }
 
     /// 根据hash获取当前播放的歌曲（通过HTTP接口）
@@ -226,12 +306,13 @@ impl PlaylistManager {
 
         debug!("获取当前歌曲: {}", url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .send()
             .await
             .map_err(|e| format!("发送请求失败: {}", e))?;
-        
+
         if !resp.status().is_success() {
             return Err(format!("请求失败，状态码: {}", resp.status()));
         }
@@ -246,19 +327,16 @@ impl PlaylistManager {
         }
 
         // 提取正在演唱的歌曲
-        let sung_url: Option<String> = if let Some(list_array) = resp_json["list"].as_array() {
-            list_array
-                .iter()
-                .rev()
-                .find(|item| {
-                    item.get("state")
-                        .is_some_and(|s| s.as_str().unwrap_or("") == "sung")
-                })
-                .and_then(|item| item["url"].as_str())
-                .map(extract_bv_id)
-        } else {
-            None
-        };
+        let sung_url: Option<String> =
+            if let Some(singing_obj) = resp_json["list"]["singing"].as_object() {
+                singing_obj
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(extract_bv_id)
+            } else {
+                info!("没有正在演唱的歌曲");
+                None
+            };
 
         Ok(sung_url)
     }
@@ -272,14 +350,15 @@ impl PlaylistManager {
             .await
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
             .json(&json!({"idArrayHash": temp_hash}))
             .send()
             .await
             .map_err(|e| format!("发送请求失败: {}", e))?;
-        
+
         let resp_json: serde_json::Value = resp
             .json()
             .await
@@ -342,7 +421,8 @@ impl PlaylistManager {
 
         debug!("正在获取播放列表: {}", url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .send()
             .await
@@ -395,4 +475,3 @@ impl PlaylistManager {
         Ok(sung_url)
     }
 }
-

@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     println!("=== KTV投屏DLNA应用启动 ===");
-    println!("输入房间链接，如 http://127.0.0.1:1145/102 或 https://ktv.example.com/102");
+    println!("输入房间链接，如 http://127.0.0.1:1145/room?roomId=102 或 https://ktv.example.com/room?roomId=102");
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("无法读取输入");
     let url_str = input.trim();
@@ -48,19 +48,15 @@ async fn main() -> Result<()> {
     let base_url = parsed_url[..Position::AfterPort].to_string();
     info!("Base URL: {}", base_url);
 
-    // ③ 从路径中取最后一段（非空）作为 room_id
-    let segments: Vec<&str> = parsed_url
-        .path_segments()
-        .map(|s| s.filter(|seg| !seg.is_empty()).collect())
-        .unwrap_or_default();
-
-    if segments.is_empty() {
-        error!("错误：没有找到房间号");
-        bail!("No room id")
-    }
-
-    let room_str = segments.last().unwrap();
-    let room_id: String = room_str.to_string();
+    let room_id = parsed_url.query_pairs()
+        .find(|(key, _)| key == "roomId")
+        .map(|(_, value)| value.to_string())
+        .or_else(|| {
+            parsed_url.path_segments()
+                .and_then(|segments| segments.last())
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("无法从 URL 中提取 room_id"))?;
     info!("Parsed room_id: {}", room_id);
 
     // 询问用户昵称（可选）
@@ -118,34 +114,32 @@ async fn main() -> Result<()> {
     let device_cloned = device.clone();
 
     // 设置歌曲变化回调（需要克隆controller和device）
+    // 注意：直接在 playlist_manager 上设置回调，而不是创建新的 callback_pm 实例
     let controller_for_callback = controller.clone();
     let device_for_callback = device.clone();
-    let callback_pm = PlaylistManager::new(&base_url, room_id.clone(), nickname.clone());
-    tokio::spawn(async move {
-        callback_pm.set_on_song_change(move |url| {
-            let controller = controller_for_callback.clone();
-            let device = device_for_callback.clone();
-            tokio::spawn(async move {
-                // 停止当前播放
-                retry_until_success("停止播放", 500, || async {
-                    controller.stop(&device).await.map_err(|e| e.to_string())
-                }).await.ok();
-                
-                // 设置AVTransport URI
-                retry_until_success("设置AVTransport URI", 500, || async {
-                    controller
-                        .set_avtransport_uri(&device, &url, "", local_ip, server_port)
-                        .await
-                        .map_err(|e| e.to_string())
-                }).await.ok();
-                
-                // 播放
-                retry_until_success("播放", 500, || async {
-                    controller.play(&device).await.map_err(|e| e.to_string())
-                }).await.ok();
-            });
-        }).await;
-    });
+    playlist_manager.set_on_song_change(move |url| {
+        let controller = controller_for_callback.clone();
+        let device = device_for_callback.clone();
+        tokio::spawn(async move {
+            // 停止当前播放
+            retry_until_success("停止播放", 500, || async {
+                controller.stop(&device).await.map_err(|e| e.to_string())
+            }).await.ok();
+            
+            // 设置AVTransport URI
+            retry_until_success("设置AVTransport URI", 500, || async {
+                controller
+                    .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                    .await
+                    .map_err(|e| e.to_string())
+            }).await.ok();
+            
+            // 播放
+            retry_until_success("播放", 500, || async {
+                controller.play(&device).await.map_err(|e| e.to_string())
+            }).await.ok();
+        });
+    }).await;
 
     // 启动WebSocket监听（需要克隆playlist_manager）
     let pm_ws = playlist_manager.clone();
