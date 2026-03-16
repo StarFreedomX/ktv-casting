@@ -9,6 +9,15 @@
 
 跟随网页的正在播放曲目进行投屏，结束自动切歌。也可以在网页端操作进行切歌。
 
+命令行支持`Ctrl+P`暂停/继续播放
+
+## 环境变量设置
+
+- `KTV_SYNC_MODE`：同步模式，支持`WS`（WebSocket, 默认）和`POLLING`（轮询）。设置为`WS`时会使用WebSocket连接进行实时同步，延迟更低~~(对ktv-song-web服务器压力更小)~~。
+- `RUST_LOG`：日志等级设置，有`error`、`warn`、`info`、`debug`等，参考[env_logger文档](https://docs.rs/env_logger/latest/env_logger/)。
+- `KTV_NICKNAME`：设置投屏设备的名称。
+- `KEEP_ALIVE_INTERVAL`：连接Keep-Alive间隔，单位秒，默认30秒。
+
 ## 手机app（推荐）
 
 移步[ktv-casting-android-app](https://github.com/birchtree2/ktv-casting-android-app)

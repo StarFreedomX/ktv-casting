@@ -1,4 +1,3 @@
-use crate::utils::extract_bv_id;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
@@ -6,52 +5,55 @@ use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, future::Future};
 use tokio::sync::Mutex;
-use tokio::time::{Interval, sleep};
+#[cfg(test)]
+use tokio::time::sleep;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use url::Url;
 
 #[derive(Clone)]
 pub struct PlaylistManager {
     url: String,
     room_id: String,
-    nickname: String,
+    client: Client,
     hash: Arc<Mutex<Option<String>>>,
     song_playing: Arc<Mutex<Option<String>>>,
-    on_song_change: Arc<Mutex<Option<Arc<dyn Fn(String) + Send + Sync>>>>,
-    client: Client,
+    song_title: Arc<Mutex<Option<String>>>,
 }
 
 impl PlaylistManager {
-    pub fn new(url: &str, room_id: String, nickname: Option<String>) -> Self {
+    pub fn new(url: &str, room_id: String) -> Self {
+        // 在初始化时构建一次 Client
         let client = Client::builder()
             .use_rustls_tls()
             .build()
-            .expect("Failed to create HTTP client");
-
+            .expect("构建 HTTP 客户端失败");
         Self {
             url: url.to_string(),
             room_id,
-            nickname: nickname.unwrap_or_else(|| "ktv-casting".to_string()),
+            client,
             hash: Arc::new(Mutex::new(None)),
             song_playing: Arc::new(Mutex::new(None)),
-            on_song_change: Arc::new(Mutex::new(None)),
-            client,
+            song_title: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 设置歌曲变化回调函数（异步版本）
-    pub async fn set_on_song_change<F>(&self, callback: F)
-    where
-        F: Fn(String) + Send + Sync + 'static,
-    {
-        let mut on_song_change = self.on_song_change.lock().await;
-        *on_song_change = Some(Arc::new(callback));
-    }
-
-    /// 启动WebSocket连接并监听（包含自动重连）
-    pub async fn start_websocket_listener(self: Arc<Self>) -> Result<(), String> {
-        let mut backoff = 1;
+    // 适配新的返回结构：
+    // {
+    //   changed: boolean,
+    //   list: { queued: Song[]; singing: Song; sung: Song[] },
+    //   hash: string
+    // }
+    // Song { id, title, url, addedBy? }
+    async fn fetch_playlist(&self) -> Result<Option<String>, String> {
+        let last_hash = self
+            .hash
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "EMPTY_LIST_HASH".into());
 
         loop {
             match Arc::clone(&self).connect_websocket_internal().await {
@@ -103,7 +105,10 @@ impl PlaylistManager {
 
         info!("正在连接到WebSocket: {}", ws_url);
 
-        let (ws_stream, _) = connect_async(&ws_url)
+        let resp = self
+            .client
+            .get(&url)
+            .send()
             .await
             .map_err(|e| format!("WebSocket连接失败: {}", e))?;
 
@@ -114,178 +119,300 @@ impl PlaylistManager {
 
         info!("开始监听消息...");
 
-        // 启动消息监听任务
-        tokio::spawn(async move {
-            Self::message_listener(self, ws_stream).await;
-        });
-
-        Ok(())
-    }
-
-    /// 获取初始歌曲状态（用于WebSocket连接成功后立即获取当前播放的歌曲）
-    async fn fetch_initial_state(&self) {
-        // 使用空hash获取当前歌曲状态
-        let empty_hash = "";
-        
-        let url = format!(
-            "{}/api/songListInfo?roomId={}&lastHash={}",
-            self.url, self.room_id, empty_hash
-        );
-
-        info!("获取初始歌曲状态: {}", url);
-
-        let resp = match self.client.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("获取初始歌曲状态失败: {}", e);
-                return;
+        let extract_bv_function = |url: &str| {
+            // 提取 bilibili://video/ 后面的部分
+            if let Some(start) = url.find("bilibili://video/") {
+                let after_prefix = &url[start + "bilibili://video/".len()..];
+                after_prefix.to_string().replace("?", "-").replace("=", "") // 保持原有 bilibili 逻辑
+            } else if url.starts_with("http") {
+                // 如果是直接链接（如 eplus），不做任何替换，保持完整参数
+                url.to_string()
+            } else {
+                url.to_string().replace("?", "-").replace("=", "")
             }
         };
-
-        if !resp.status().is_success() {
-            error!("获取初始歌曲状态失败，状态码: {}", resp.status());
-            return;
-        }
-
-        let resp_json: serde_json::Value = match resp.json().await {
-            Ok(json) => json,
-            Err(e) => {
-                error!("解析初始歌曲状态JSON失败: {}", e);
-                return;
-            }
-        };
-
-        // 获取 hash 值
-        let new_hash = resp_json["hash"]
+        let singing_title: Option<String> = resp_json["list"]["singing"]["title"]
             .as_str()
-            .unwrap_or("")
-            .to_string();
+            .map(|s| s.to_string());
 
-        // 提取正在演唱的歌曲
-        let sung_url: Option<String> = if let Some(singing_obj) = resp_json["list"]["singing"].as_object() {
-            singing_obj
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(extract_bv_id)
+        // 当前正在演唱的歌曲：list.singing.url
+        let singing_url: Option<String> = resp_json["list"]["singing"]["url"]
+            .as_str()
+            .map(extract_bv_function);
+
+        info!("新的hash: {}", new_hash);
+
+        // 更新状态
+        *self.song_playing.lock().await = singing_url.clone();
+        *self.song_title.lock().await = singing_title; // 更新标题
+        *self.hash.lock().await = Some(new_hash);
+
+        Ok(singing_url)
+    }
+
+    // 根据环境变量切换同步驱动（WS / POLLING）
+    // 环境变量：KTV_SYNC_MODE = "WS" 或 "POLLING"（不区分大小写），默认为 WS
+    pub fn start_sync<F>(&self, f_on_update: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let mode = env::var("KTV_SYNC_MODE").unwrap_or_else(|_| "WS".to_string());
+        info!("播放列表同步模式: {}", mode);
+        if mode.to_uppercase() != "POLLING" {
+            self.start_ws_update(f_on_update);
         } else {
-            None
-        };
-
-        // 更新 hash 值
-        let mut hash_guard = self.hash.lock().await;
-        *hash_guard = Some(new_hash.clone());
-        drop(hash_guard);
-
-        // 如果有歌曲正在播放，触发回调
-        if let Some(song_url) = sung_url {
-            info!("初始歌曲状态: {}", song_url);
-            
-            let mut song_playing = self.song_playing.lock().await;
-            *song_playing = Some(song_url.clone());
-            drop(song_playing);
-
-            // 触发回调进行投屏
-            if let Some(callback) = self.on_song_change.lock().await.as_ref() {
-                callback(song_url);
-            }
-        } else {
-            info!("当前没有正在演唱的歌曲");
+            self.start_periodic_update(f_on_update);
         }
     }
 
-    /// 消息监听循环
-    async fn message_listener(
-        self: Arc<Self>,
-        mut ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    ) {
-        let mut ping_interval: Interval = tokio::time::interval(Duration::from_secs(30));
-        let mut last_pong_time = std::time::Instant::now();
+    fn start_ws_update<F>(&self, f_on_update: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            /*
+               这是维护WebSocket连接的循环
+               负责连接、重连
+            */
+            let interval_secs = env::var("KEEP_ALIVE_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            info!("心跳间隔: {} 秒", interval_secs);
+            loop {
+                // 构造 WS URL （将 http(s) -> ws(s)）
+                let nickname = env::var("KTV_NICKNAME").unwrap_or_default();
+                let mut ws_url = format!(
+                    "{}/api/ws?roomId={}&nickname={}",
+                    self_clone.url.trim_end_matches('/'),
+                    self_clone.room_id,
+                    urlencoding::encode(&nickname)
+                );
+                if let Ok(mut parsed) = Url::parse(&ws_url) {
+                    let _ = match parsed.scheme() {
+                        "https" => parsed.set_scheme("wss"),
+                        "http" => parsed.set_scheme("ws"),
+                        _ => Ok(()),
+                    };
+                    ws_url = parsed.to_string();
+                }
 
-        loop {
-            tokio::select! {
-                msg = ws_stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            // 处理UPDATE消息
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-                                && let Some(msg_type) = json.get("type").and_then(|t| t.as_str())
-                                    && msg_type == "UPDATE"
-                                        && let Some(hash) = json.get("hash").and_then(|h| h.as_str()) {
-                                            self.handle_update(hash.to_string()).await;
-                                        }
+                info!("WebSocket Connecting: {}", ws_url);
+
+                // 调试用代码
+                /* let url = match url::Url::parse(&ws_url) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        error!("URL 解析失败: {}", e);
+                        break;
+                    }
+                };
+                let host = url.host_str().unwrap_or_default().to_string();
+                let port = url.port_or_known_default().unwrap_or(443);
+
+                // 异步 DNS 解析
+                let addrs = match tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs;
+                    (host.as_str(), port).to_socket_addrs()
+                })
+                .await
+                {
+                    Ok(Ok(addr_iter)) => addr_iter,
+                    _ => {
+                        error!("DNS 解析失败");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                let addr = match addrs.into_iter().next() {
+                    Some(a) => a,
+                    None => {
+                        error!("DNS 未找到记录");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                info!("DNS 解析成功: {}", addr);
+
+                // 建立 TCP 连接
+                let stream = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    tokio::net::TcpStream::connect(addr),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => {
+                        error!("TCP 连接超时或拒绝");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                info!("TCP 已连接，准备 WS 握手...");
+
+                // WebSocket 握手
+
+                // 加载 webpki 根证书
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                // 2. 创建配置 (支持 TLS 1.2 和 1.3)
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+
+                let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config));
+
+                let (mut ws_stream, _) = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    tokio_tungstenite::client_async_tls_with_config(
+                        ws_url.clone(),
+                        stream,
+                        None,
+                        Some(connector),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(val)) => val,
+                    Ok(Err(e)) => {
+                        error!("WS 握手报错: {:?}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        error!("WS 握手超时");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }; */
+
+                let (ws_stream, _) = match connect_async(ws_url).await {
+                    Ok(val) => val,
+                    Err(e) => {
+                        error!("连接 WebSocket 失败: {}", e);
+                        continue;
+                    }
+                };
+
+                info!("WebSocket connected for room {}", self_clone.room_id);
+
+                // 本地缓存当前正在播放的歌曲，用于判断是否需要触发投屏切换
+                let mut song_playing_cached: Option<String> =
+                    self_clone.song_playing.lock().await.clone();
+                match self_clone.fetch_playlist().await {
+                    Ok(Some(url)) => {
+                        if Some(url.clone()) != song_playing_cached {
+                            info!("检测到新歌曲，初始化投屏: {}", url);
+                            f_on_update(url.clone()).await;
+                            song_playing_cached = Some(url);
+                        } else {
+                            info!("重连成功，歌曲未变，跳过重复投屏");
                         }
-                        Some(Ok(Message::Ping(data))) => {
-                            debug!("收到ping，发送pong");
-                            if ws_stream.send(Message::Pong(data)).await.is_err() {
-                                warn!("发送pong失败");
+                    }
+                    Ok(None) => debug!("歌单目前为空，等待点歌..."),
+                    Err(e) => error!("初始化拉取失败: {}", e),
+                }
+                let (mut write, mut read) = ws_stream.split();
+
+                // 引入心跳计时器
+                let mut heartbeat = tokio::time::interval(Duration::from_secs(interval_secs));
+                // 设置为延迟触发模式，避免不必要的积压和短间隔
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // 立即触发第一次心跳
+                heartbeat.tick().await;
+
+                loop {
+                    tokio::select! {
+                        // 分支 A：定时发送心跳
+                        _ = heartbeat.tick() => {
+                            // 发送 WebSocket 协议层 Ping (维持 WS 长连接)
+                            if let Err(e) = write.send(Message::Ping(vec![].into())).await {
+                                warn!("发送 WS 心跳失败: {}, 准备重连", e);
                                 break;
                             }
-                        }
-                        Some(Ok(Message::Pong(_))) => {
-                            last_pong_time = std::time::Instant::now();
-                            debug!("收到pong");
-                        }
-                        Some(Ok(Message::Close(_))) => {
-                            info!("WebSocket连接已关闭");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            warn!("WebSocket错误: {}", e);
-                            break;
-                        }
-                        None => {
-                            info!("WebSocket流结束");
-                            break;
-                        }
-                        _ => {
-                            // 其他消息类型（如Binary）可以忽略或记录
-                            debug!("收到非文本消息，类型: {:?}", msg);
-                        }
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    // 定时发送ping并检查连接状态
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_pong_time) > Duration::from_secs(60) {
-                        warn!("超过60秒未收到pong，连接可能已断开");
-                        break;
-                    }
 
-                    if ws_stream.send(Message::Ping(vec![])).await.is_err() {
-                        warn!("发送ping失败，连接可能已断开");
-                        break;
+                            // Keep-Alive HTTP Connection Pool
+                            let pm_warm = self_clone.clone();
+                            tokio::spawn(async move {
+                                // 调用 fetch_playlist 会执行一次完整的 HTTP GET 请求
+                                // 从而让 reqwest 保持与后端的 TCP 连接处于活跃状态
+                                match pm_warm.fetch_playlist().await {
+                                    Ok(_) => debug!("HTTP Keep-Alive"),
+                                    Err(e) => debug!("HTTP Keep-Alive Failed: {}", e),
+                                }
+                            });
+                        }
+
+                        // 分支 B：接收 WS 消息
+                        msg = read.next() => {
+                            let msg = match msg {
+                                Some(Ok(m)) => m,
+                                Some(Err(e)) => { error!("WS 读取错误: {}", e); break; },
+                                None => { info!("WS 连接关闭"); break; }
+                            };
+
+                            match msg {
+                                Message::Text(text) => {
+                                    let v = match serde_json::from_str::<serde_json::Value>(&text) {
+                                        Ok(v) => v,
+                                        Err(e) => { error!("解析 JSON 失败: {}", e); continue; },
+                                    };
+                                    if v["type"].as_str().unwrap_or("") != "UPDATE" { continue; }
+                                    info!("收到 WS UPDATE 消息: {:?}", v);
+                                    let incoming_hash = v["hash"].as_str().unwrap_or("");
+                                    let current_hash = self_clone.hash.lock().await.clone().unwrap_or_default();
+                                    if incoming_hash == current_hash { continue; }
+
+                                    debug!("[WS UPDATE]: {} -> {}", current_hash, incoming_hash);
+                                    if let Ok(song_playing_new) = self_clone.fetch_playlist().await {
+                                        if song_playing_new != song_playing_cached {
+                                            if let Some(url) = song_playing_new.clone() {
+                                                f_on_update(url).await;
+                                            }
+                                            song_playing_cached = song_playing_new;
+                                        }
+                                    }
+                                }
+                                Message::Ping(p) => {
+                                    let _ = write.send(Message::Pong(p)).await;
+                                }
+                                Message::Close(_) => { info!("服务器关闭连接"); break; }
+                                _ => {}
+                            }
+                        }
                     }
-                    debug!("发送ping");
                 }
+
+                // 等待并重连
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                debug!("重连 WS...");
             }
-        }
-
-        info!("WebSocket监听结束");
+        });
     }
 
-    /// 处理UPDATE消息
-    async fn handle_update(&self, new_hash: String) {
-        let hash_guard = self.hash.lock().await;
-        let old_hash = hash_guard.clone();
-        drop(hash_guard);
-
-        // 如果hash发生变化，使用old_hash获取当前播放的歌曲，否则可能会因为hash已经更新而无法正确获取当前歌曲信息
-        if old_hash != Some(new_hash.clone()) {
-            info!("检测到歌单更新，old_hash: {:?} -> new_hash: {}", old_hash, new_hash);
-
-            // 调用HTTP接口获取完整歌单信息（使用old_hash）
-            if let Ok(song_url) = self.fetch_current_song_from_hash(old_hash.as_deref().unwrap_or("")).await {
-                debug!("当前播放的歌曲URL: {:?}", song_url);
-                let mut song_playing = self.song_playing.lock().await;
-                let old_song = song_playing.clone();
-                *song_playing = song_url.clone();
-                drop(song_playing);
-
-                if old_song != song_url {
-                    if let Some(song_url) = song_url {
-                        info!("歌曲已切换为: {}", song_url);
-                        if let Some(callback) = self.on_song_change.lock().await.as_ref() {
-                            callback(song_url);
+    pub fn start_periodic_update<F>(&self, f_on_update: F)
+    where
+        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+    {
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+            let mut song_playing: Option<String> = None;
+            loop {
+                interval.tick().await;
+                match self_clone.fetch_playlist().await {
+                    Err(e) => error!("定时更新播放列表失败: {}", e),
+                    Ok(song_playing_new) => {
+                        if song_playing_new != song_playing {
+                            if let Some(url) = song_playing_new.clone() {
+                                f_on_update(url).await; // await the future
+                            }
+                            song_playing = song_playing_new;
                         }
                     }
                 }
@@ -350,7 +477,6 @@ impl PlaylistManager {
             .await
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".to_string());
-
         let resp = self
             .client
             .post(&url)
@@ -377,58 +503,32 @@ impl PlaylistManager {
         self.song_playing.lock().await.clone()
     }
 
+    pub async fn get_song_title(&self) -> Option<String> {
+        self.song_title.lock().await.clone()
+    }
+}
+
     /// 获取当前hash
     pub async fn get_hash(&self) -> Option<String> {
         self.hash.lock().await.clone()
     }
 
-    /// 遗留的轮询方法（当WebSocket不可用时使用）
-    pub fn start_periodic_update_legacy<F>(&self, f_on_update: F)
-    where
-        F: Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
-    {
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-            let mut song_playing: Option<String> = None;
-            loop {
-                interval.tick().await;
-                match self_clone.fetch_playlist().await {
-                    Err(e) => error!("定时更新播放列表失败: {}", e),
-                    Ok(song_playing_new) => {
-                        if song_playing_new != song_playing {
-                            if let Some(url) = song_playing_new.clone() {
-                                f_on_update(url).await;
-                            }
-                            song_playing = song_playing_new;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// 旧的fetch_playlist方法（用于轮询模式）
-    async fn fetch_playlist(&self) -> Result<Option<String>, String> {
-        let hash_guard = self.hash.lock().await;
-        let last_hash = hash_guard.clone().unwrap_or("EMPTY_LIST_HASH".to_string());
-        drop(hash_guard);
-
-        let url = format!(
-            "{}/api/songListInfo?roomId={}&lastHash={}",
-            self.url, self.room_id, last_hash
-        );
+    let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string());
 
         debug!("正在获取播放列表: {}", url);
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("发送请求失败: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("请求失败，状态码: {}", resp.status()));
+    // --- 第一次操作 ---
+    match manager.fetch_playlist().await {
+        Ok(_) => {
+            println!("✓ 成功获取播放列表");
+            // 获取当前播放的歌曲
+            {
+                let song_playing = manager.get_song_playing().await;
+                match &song_playing {
+                    Some(url) => println!("当前播放的歌曲: {}", url),
+                    None => println!("当前没有播放的歌曲"),
+                }
+            }
         }
 
         let resp_json: serde_json::Value = resp
@@ -437,10 +537,14 @@ impl PlaylistManager {
             .map_err(|e| format!("解析JSON失败: {}", e))?;
         let changed: bool = resp_json["changed"].as_bool().unwrap_or(false);
 
-        if !changed {
-            debug!("播放列表未改变，跳过更新");
-            return Ok(self.song_playing.lock().await.clone());
+    // 获取当前播放的歌曲
+    {
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
         }
+    }
 
         // 获取新的 hash 值
         let new_hash = resp_json["hash"]
@@ -467,10 +571,14 @@ impl PlaylistManager {
         *song_playing = sung_url.clone();
         drop(song_playing);
 
-        // 更新 hash 值
-        let mut hash = self.hash.lock().await;
-        *hash = Some(new_hash);
-        drop(hash);
+    // 获取当前播放的歌曲
+    {
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
+        }
+    }
 
         Ok(sung_url)
     }
