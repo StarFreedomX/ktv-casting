@@ -1,256 +1,240 @@
-#![cfg(feature = "cli")]
+use crate::dlna_controller::DlnaController;
+use actix_web::{App, HttpServer, web};
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self};
-use crossterm::terminal;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
-use ktv_casting_lib::dlna_controller::{DlnaController, DlnaDevice};
-use ktv_casting_lib::{ENGINE_STATE, start_engine_core, toggle_pause_core, trigger_next_song};
-use log::{Log, Metadata, Record, info};
-use std::fmt::Write;
+use local_ip_address::local_ip;
+use log::{error, info};
+use playlist_manager::PlaylistManager;
+use reqwest::Client;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use url::{Position, Url};
+use crate::utils::retry_until_success;
 
-struct ProgressLogger {
-    inner: Box<dyn Log>,
-    pb: ProgressBar,
-}
+mod bilibili_parser;
+mod dlna_controller;
+mod media_server;
+mod mp4_util;
+mod playlist_manager;
+mod utils;
 
-impl Log for ProgressLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        self.inner.enabled(metadata)
-    }
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            self.pb.suspend(|| {
-                self.inner.log(record);
-            });
-        }
-    }
-    fn flush(&self) {
-        self.inner.flush();
-    }
+pub struct SharedState {
+    pub duration_cache: Arc<Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let pb = setup_env();
-
-    // 1. 交互式获取配置
-    let (base_url, room_id) = get_room_config_interactively()?;
-    let controller = DlnaController::new();
-    let device = select_dlna_device_interactively(&controller).await?;
-
-    // 2. 准备 Runtime 传给引擎
-    let engine_rt = tokio::runtime::Runtime::new().context("Failed to create engine runtime")?;
-
-    // 3. 启动引擎逻辑 (调用 lib.rs 中的异步函数)
-    start_engine_core(base_url, room_id, device.location.clone(), engine_rt).await;
-
-    pb.set_draw_target(ProgressDrawTarget::stdout());
-
-    // 4. 键盘监听处理
-    spawn_keyboard_handler();
-
-    // 5. 调用封装好的监控函数，传入回调更新进度条
-    let pb_for_len = pb.clone();
-    let pb_for_pos = pb.clone();
-
-    // 这是一个异步死循环，会在这里持续运行直到引擎关闭或报错
-    run_cli_monitor(
-        move |total| pb_for_len.set_length(total),
-        move |curr| pb_for_pos.set_position(curr),
-    )
-    .await?;
-
-    Ok(())
-}
-
-// --- 辅助逻辑函数 ---
-async fn select_dlna_device_interactively(controller: &DlnaController) -> Result<DlnaDevice> {
-    let devices = controller.discover_devices().await.unwrap_or_default();
-    if devices.is_empty() {
-        bail!("未发现任何 DLNA 设备");
-    }
-
-    println!("发现以下设备：");
-    for (i, d) in devices.iter().enumerate() {
-        println!("{}: {} at {}", i, d.friendly_name, d.location);
-    }
-    print!("输入设备编号：");
-    io::Write::flush(&mut io::stdout())?; // 确保提示文字先打印
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let idx: usize = input.trim().parse()?;
-    devices.get(idx).cloned().context("编号无效")
-}
-
-fn spawn_keyboard_handler() {
-    let _ = terminal::enable_raw_mode();
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        loop {
-            if let Ok(event::Event::Key(key)) = event::read() {
-                if key.code == event::KeyCode::Char('c')
-                    && key.modifiers.contains(event::KeyModifiers::CONTROL)
-                {
-                    let _ = terminal::disable_raw_mode();
-                    std::process::exit(0);
-                }
-
-                if key.kind != event::KeyEventKind::Press {
-                    continue;
-                }
-
-                rt.block_on(async {
-                    match key.code {
-                        event::KeyCode::Char('p') => {
-                            if let Ok(state) = toggle_pause_core().await {
-                                info!(
-                                    "{}",
-                                    if state {
-                                        "▶ 已恢复播放"
-                                    } else {
-                                        "⏸ 已暂停"
-                                    }
-                                );
-                            }
-                        }
-                        event::KeyCode::Char('n') => {
-                            trigger_next_song();
-                            info!("⏭ 切歌");
-                        }
-                        _ => {}
-                    }
-                });
-            }
-        }
-    });
-}
-
-fn setup_pb_style(pb: &ProgressBar) {
-    pb.set_style(
-        ProgressStyle::with_template("{bar:40.green/blue} {my_pos} / {my_len}")
-            .unwrap()
-            .with_key("my_pos", |s: &ProgressState, w: &mut dyn Write| {
-                write!(w, "{:02}:{:02}", s.pos() / 60, s.pos() % 60).unwrap()
-            })
-            .with_key("my_len", |s: &ProgressState, w: &mut dyn Write| {
-                write!(
-                    w,
-                    "{:02}:{:02}",
-                    s.len().unwrap_or(0) / 60,
-                    s.len().unwrap_or(0) % 60
-                )
-                .unwrap()
-            })
-            .progress_chars("━━━"),
-    );
-    pb.set_draw_target(ProgressDrawTarget::hidden());
-}
-fn setup_env() -> ProgressBar {
     if std::env::var("RUST_LOG").is_err() {
         unsafe {
             std::env::set_var("RUST_LOG", "INFO");
         }
     }
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let pb = ProgressBar::new(0);
-    setup_pb_style(&pb);
+    env_logger::init();
 
-    let env_log = env_logger::Builder::from_default_env().build();
-    let _ = log::set_boxed_logger(Box::new(ProgressLogger {
-        inner: Box::new(env_log),
-        pb: pb.clone(),
-    }))
-    .map(|()| log::set_max_level(log::LevelFilter::Debug));
-    pb
-}
-
-fn get_room_config_interactively() -> Result<(String, String)> {
     println!("=== KTV投屏DLNA应用启动 ===");
-    println!("输入房间链接:");
+    println!("输入房间链接，如 http://127.0.0.1:1145/room?roomId=102 或 https://ktv.example.com/room?roomId=102");
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    io::stdin().read_line(&mut input).expect("无法读取输入");
     let url_str = input.trim();
-
-    let mut normalized = url_str.to_string();
-    if !normalized.contains("://") && !normalized.is_empty() {
-        normalized = format!("https://{}", normalized);
+    let mut normalized_url = url_str.to_string();
+    if !normalized_url.contains("://") && !normalized_url.is_empty() {
+        normalized_url = format!("http://{}", normalized_url);
     }
+    // ② 使用 url crate 解析并提取 base URL 与 room_id
+    let parsed_url = Url::parse(&normalized_url).with_context(|| "无法解析 URL")?;
 
-    let parsed = Url::parse(&normalized).with_context(|| format!("无法解析 URL: {}", normalized))?;
-    
-    // 提取 base_url (协议 + 域名 + 端口)
-    let base_url = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
-    let base_url = if let Some(port) = parsed.port() {
-        format!("{}:{}", base_url, port)
-    } else {
-        base_url
-    };
+    let base_url = parsed_url[..Position::AfterPort].to_string();
+    info!("Base URL: {}", base_url);
 
-    let room_str = parsed
-        .query_pairs()
+    let room_id = parsed_url.query_pairs()
         .find(|(key, _)| key == "roomId")
-        .map(|(_, v)| v.into_owned())
+        .map(|(_, value)| value.to_string())
         .or_else(|| {
-            parsed
-                .path_segments()?
-                .filter(|s| !s.is_empty())
-                .last()
+            parsed_url.path_segments()
+                .and_then(|segments| segments.last())
                 .map(|s| s.to_string())
         })
-        .with_context(|| "URL 中未找到房间号")?;
-    
-    info!("解析成功: BaseURL={}, RoomID={}", base_url, room_str);
-    Ok((base_url, room_str))
-}
+        .ok_or_else(|| anyhow::anyhow!("无法从 URL 中提取 room_id"))?;
+    info!("Parsed room_id: {}", room_id);
 
-/// 负责进度查询、自动切歌，并通过回调更新 UI
-async fn run_cli_monitor<FL, FP>(mut set_len: FL, mut set_pos: FP) -> anyhow::Result<()>
-where
-    FL: FnMut(u64),
-    FP: FnMut(u64),
-{
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    // 询问用户昵称（可选）
+    println!("输入您的昵称（直接回车使用默认值 'ktv-casting'）：");
+    input.clear();
+    io::stdin().read_line(&mut input).expect("无法读取输入");
+    let nickname = input.trim().to_string();
+    let nickname = if nickname.is_empty() { None } else { Some(nickname) };
 
-        let guard = ENGINE_STATE.read().unwrap();
-        if let Some(ctx) = guard.as_ref() {
-            // 1. 查询 DLNA 进度
-            if let Ok((curr, _)) = ctx.controller.get_secs(&ctx.device).await {
-                let curr_u64 = curr as u64;
+    let server_port = 8080;
+    let playlist_manager = Arc::new(PlaylistManager::new(&base_url, room_id.clone(), nickname.clone()));
 
-                // 2. 获取总时长
-                if let Some(playing) = ctx.playlist_manager.get_song_playing().await {
-                    let cache = ctx.duration_cache.lock().await;
-                    if let Some(&total) = cache.get(&playing) {
-                        let total_u64 = total as u64;
+    let duration_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let shared_state = web::Data::new(SharedState {
+        duration_cache: duration_cache.clone(),
+    });
 
-                        set_len(total_u64);
-                        set_pos(curr_u64);
+    // 1. 创建 Reqwest Client
+    let client = Client::builder()
+        .use_rustls_tls()
+        .build()
+        .expect("Failed to create client");
 
-                        // 3. 自动切歌逻辑
-                        if total_u64 > 0
-                            && curr_u64 > 5
-                            && total_u64 > curr_u64
-                            && (total_u64 - curr_u64) <= 2
-                        {
-                            log::info!(">> 歌曲即将结束，自动切换下一首...");
-                            let mut pm = ctx.playlist_manager.clone();
-                            let _ = pm.next_song().await;
+    let client_data = web::Data::new(client);
 
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
+    // 2. 配置 HttpServer，运行
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(client_data.clone())
+            .app_data(shared_state.clone())
+            .service(media_server::proxy_handler)
+    })
+    .bind(("0.0.0.0", server_port))?
+    .run();
+
+    let local_ip = local_ip()?;
+    let controller = DlnaController::new();
+    let devices = controller.discover_devices().await?;
+    if devices.is_empty() {
+        bail!("No DLNA Devices");
+    }
+    println!("发现以下DLNA设备：");
+    println!("编号: 设备名称 at 设备地址");
+    for (i, device) in devices.iter().enumerate() {
+        println!("{}: {} at {}", i, device.friendly_name, device.location);
+    }
+    println!("输入设备编号：");
+    input.clear();
+    io::stdin().read_line(&mut input).expect("读取编号失败");
+    let device_num: usize = input.trim().parse()?;
+    if device_num > devices.len() {
+        bail!("编号有误");
+    }
+    let device = devices[device_num].clone(); // clone owned copy
+    let device_cloned = device.clone();
+
+    // 设置歌曲变化回调（需要克隆controller和device）
+    // 注意：直接在 playlist_manager 上设置回调，而不是创建新的 callback_pm 实例
+    let controller_for_callback = controller.clone();
+    let device_for_callback = device.clone();
+    playlist_manager.set_on_song_change(move |url| {
+        let controller = controller_for_callback.clone();
+        let device = device_for_callback.clone();
+        tokio::spawn(async move {
+            // 停止当前播放
+            retry_until_success("停止播放", 500, || async {
+                controller.stop(&device).await.map_err(|e| e.to_string())
+            }).await.ok();
+            
+            // 设置AVTransport URI
+            retry_until_success("设置AVTransport URI", 500, || async {
+                controller
+                    .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                    .await
+                    .map_err(|e| e.to_string())
+            }).await.ok();
+            
+            // 播放
+            retry_until_success("播放", 500, || async {
+                controller.play(&device).await.map_err(|e| e.to_string())
+            }).await.ok();
+        });
+    }).await;
+
+    // 启动WebSocket监听（需要克隆playlist_manager）
+    let pm_ws = playlist_manager.clone();
+    match pm_ws.start_websocket_listener().await {
+        Ok(_) => info!("WebSocket监听已启动"),
+        Err(e) => {
+            error!("WebSocket连接失败: {}，将退回到轮询模式", e);
+            // 如果WebSocket连接失败，退回到轮询模式
+            let controller_for_poll = controller.clone();
+            let device_for_poll = device.clone();
+            playlist_manager.start_periodic_update_legacy(move |url| {
+                let controller = controller_for_poll.clone();
+                let device = device_for_poll.clone();
+                Box::pin(async move {
+                    // 停止当前播放
+                    retry_until_success("停止播放", 500, || async {
+                        controller.stop(&device).await.map_err(|e| e.to_string())
+                    }).await.ok();
+                    
+                    // 设置AVTransport URI
+                    retry_until_success("设置AVTransport URI", 500, || async {
+                        controller
+                            .set_avtransport_uri(&device, &url, "", local_ip, server_port)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }).await.ok();
+                    
+                    // 播放
+                    retry_until_success("播放", 500, || async {
+                        controller.play(&device).await.map_err(|e| e.to_string())
+                    }).await.ok();
+                })
+            });
+        }
+    }
+
+    tokio::spawn(async move {
+        let controller = DlnaController::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut current_secs: u32 = 0;
+        let mut total_secs: u32 = 0;
+        loop {
+            interval.tick().await;
+
+            // 首先尝试从缓存中获取总长度
+            let mut cached_total = 0;
+            if let Some(playing) = playlist_manager.get_song_playing().await {
+                let cache = duration_cache.lock().await;
+                if let Some(&d) = cache.get(&playing) {
+                    cached_total = d;
+                }
+            }
+
+            // 使用重试逻辑获取播放进度
+            let result = retry_until_success("获取播放进度", 500, || async {
+                controller.get_secs(&device_cloned).await.map_err(|e| e.to_string())
+            }).await;
+
+            match result {
+                Ok((current, _)) => {
+                    current_secs = current;
+
+                    // 如果从缓存拿到了长度，
+                    if cached_total > 0 {
+                        total_secs = cached_total;
+                        info!("使用缓存的视频时长: {}s", total_secs);
+                    }
+
+                    let remaining_secs = total_secs.saturating_sub(current_secs);
+
+                    info!(
+                        "获取播放进度成功，当前时间{}秒，总时间{}秒，剩余时间{}秒",
+                        current_secs, total_secs, remaining_secs
+                    );
+
+                    if remaining_secs <= 2 && total_secs > 0 {
+                        info!(
+                            "剩余时间{}秒，总时间{}秒，准备切歌",
+                            remaining_secs, total_secs
+                        );
+                        // 重试next_song
+                        retry_until_success("下一首歌曲", 500, || async {
+                            playlist_manager.next_song().await.map_err(|e| e.to_string())
+                        }).await.ok();
+                        sleep(Duration::from_secs(5)).await;
                     }
                 }
                 Err(e) => {
                     error!("获取播放进度失败: {}", e);
                 }
             }
-        } else {
-            break;
         }
-    }
+    });
+    server.await?;
+
+    println!("应用已退出");
     Ok(())
 }

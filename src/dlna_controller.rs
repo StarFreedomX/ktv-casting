@@ -5,7 +5,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use rupnp::Device;
 use rupnp::http::Uri;
 use rupnp::ssdp::{SearchTarget, URN};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -104,7 +104,7 @@ fn log_upnp_action(service: &rupnp::Service, base_url: &Uri, action: &str, args_
     // Logged body is a best-effort “wire-like” payload for diffing.
     let envelope = build_soap_envelope(action, args_xml);
 
-    log::debug!(
+    log::info!(
         "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction={}",
         base_url,
         service.service_id(),
@@ -129,7 +129,7 @@ async fn avtransport_action_compat(
     // 首先尝试使用 rupnp 原生的 action 方法（适用于Windows Media Player等标准设备）
     match service.action(base_url, action, args_xml).await {
         Ok(response) => {
-            log::debug!("UPnP Action (native) succeeded");
+            log::info!("UPnP Action (native) succeeded");
             log::debug!("UPnP Action (native) response: {:?}", response);
             return Ok(response);
         }
@@ -330,27 +330,23 @@ impl DlnaController {
     pub async fn discover_devices(&self) -> Result<Vec<DlnaDevice>, rupnp::Error> {
         log::info!("正在搜索DLNA设备...");
 
+        // 使用正确的SearchTarget构造方法 - 搜索AVTransport服务
         let search_target = SearchTarget::URN(AV_TRANSPORT);
         let devices_stream = rupnp::discover(&search_target, Duration::from_secs(5), None).await?;
 
+        // 将Stream转换为Vec
         let devices: Vec<Result<Device, rupnp::Error>> = devices_stream.collect().await;
-        log::debug!("发现设备总数: {}", devices.len());
-        let mut dlna_devices = Vec::new();
 
-        let mut seen_locations = HashSet::new();
+        let mut dlna_devices = Vec::new();
 
         for device_result in devices {
             match device_result {
                 Ok(device) => {
-                    let location = device.url().to_string();
-
-                    if !seen_locations.insert(location.clone()) {
-                        continue;
-                    }
-
+                    // 检查是否是媒体渲染器设备
                     let device_type_str = device.device_type().to_string();
                     if device_type_str.contains("MediaRenderer") {
                         let friendly_name = device.friendly_name().to_string();
+                        let location = device.url().to_string();
 
                         // 检查设备是否支持AVTransport服务
                         let services: Vec<URN> = device
@@ -436,14 +432,7 @@ impl DlnaController {
         // If caller didn't provide metadata, generate a minimal DIDL-Lite for compatibility.
         let metadata = if current_uri_metadata.trim().is_empty() {
             // Title can be anything; devices often only care about protocolInfo.
-            let protocol_info = if current_uri.contains(".m3u8") {
-                log::info!("检测到HLS流，使用宽松的协议描述以提高兼容性");
-                Some("http-get:*:application/vnd.apple.mpegurl:*")
-            }else{
-                None
-            };
-            log::info!("没有提供元数据，正在生成默认的DIDL-Lite元数据...");
-            build_didl_lite_metadata(current_uri, &media_url, protocol_info)
+            build_didl_lite_metadata(current_uri, &media_url, None)
         } else {
             current_uri_metadata.to_string()
         };
@@ -676,39 +665,6 @@ impl DlnaController {
         Ok((current_secs, total_secs))
     }
 
-    // 设置播放进度（跳转到指定秒数）
-    pub async fn seek(&self, device: &DlnaDevice, seconds: u32) -> Result<(), rupnp::Error> {
-        let avtransport = self
-            .get_avtransport_service(device)
-            .ok_or(rupnp::Error::ParseError("设备不支持AVTransport服务"))?;
-
-        // 将秒数转换为 HH:MM:SS 格式
-        let hours = seconds / 3600;
-        let minutes = (seconds % 3600) / 60;
-        let secs = seconds % 60;
-        let target_time = format!("{:02}:{:02}:{:02}", hours, minutes, secs);
-
-        log::info!("正在发送Seek指令，跳转至: {}", target_time);
-
-        // Unit 常用选项:
-        // REL_TIME: 按照时间进度跳转 (最常用)
-        // TRACK_NR: 按照轨道编号跳转
-        let action = "Seek";
-        let args_str = format!(
-            "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{}</Target>",
-            target_time
-        );
-
-        let base_url = device_location_uri(device)?;
-        log_upnp_action(avtransport, &base_url, action, &args_str);
-
-        // 发送请求
-        let response = avtransport_action_compat(avtransport, &base_url, action, &args_str).await?;
-        log::info!("Seek响应: {:?}", response);
-
-        Ok(())
-    }
-
     // 设置渲染器音量
     pub async fn set_volume(&self, device: &DlnaDevice, volume: u32) -> Result<(), rupnp::Error> {
         let rendering_control = device
@@ -730,7 +686,7 @@ impl DlnaController {
 
         let base_url = device_location_uri(device)?;
         // RenderingControl uses a different service; still log with a reasonable SOAPAction.
-        log::debug!(
+        log::info!(
             "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
             base_url,
             rendering_control.service_id(),
@@ -775,7 +731,7 @@ impl DlnaController {
             "#;
 
         let base_url = device_location_uri(device)?;
-        log::debug!(
+        log::info!(
             "UPnP Action -> base_url={} service_id={} service_type={} SOAPAction=\"urn:schemas-upnp-org:service:RenderingControl:1#{}\"",
             base_url,
             rendering_control.service_id(),
