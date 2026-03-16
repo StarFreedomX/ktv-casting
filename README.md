@@ -3,7 +3,7 @@
 [开发者文档](docs/DEVELOPER.md)
 ## 使用方式
 
-输入搭建好的[ktv-song-web](https://github.com/StarFreedomX/ktv-song-web)服务的网址（含对应房间编号），如`http://ktv.example.com/101`，随后选择搜索到的DLNA设备，即可使用。
+输入搭建好的[ktv-song-web](https://github.com/StarFreedomX/ktv-song-web)服务的网址（含对应房间编号），如`http://ktv.example.com/room?roomId=111`，随后选择搜索到的DLNA设备，即可使用。
 
 ## 功能
 
@@ -18,7 +18,11 @@
 - `KTV_NICKNAME`：设置投屏设备的名称。
 - `KEEP_ALIVE_INTERVAL`：连接Keep-Alive间隔，单位秒，默认30秒。
 
-## 手机上怎么用
+## 手机app（推荐）
+
+移步[ktv-casting-android-app](https://github.com/birchtree2/ktv-casting-android-app)
+
+## 手机上怎么用命令行程序（不推荐）
 
 1. 下载并安装[Termux](https://termux.com/)。
 2. 从[这里](https://github.com/aspromise/ktv-casting/releases)下载最新的`ktv-casting-aarch64-linux-android`可执行文件。

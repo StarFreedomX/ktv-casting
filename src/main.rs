@@ -244,6 +244,9 @@ where
                         }
                     }
                 }
+                Err(e) => {
+                    error!("获取播放进度失败: {}", e);
+                }
             }
         } else {
             break;

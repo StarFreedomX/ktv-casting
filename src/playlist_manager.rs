@@ -55,39 +55,69 @@ impl PlaylistManager {
             .clone()
             .unwrap_or_else(|| "EMPTY_LIST_HASH".into());
 
-        let url = format!(
-            "{}/api/songListInfo?roomId={}&lastHash={}",
-            self.url, self.room_id, last_hash
+        loop {
+            match Arc::clone(&self).connect_websocket_internal().await {
+                Ok(_) => {
+                    info!("WebSocket连接成功");
+                    backoff = 1; // 重置退避
+                }
+                Err(e) => {
+                    warn!("WebSocket连接失败: {}，{}秒后重试", e, backoff);
+                    sleep(Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60); // 指数退避，最大60秒
+                    continue;
+                }
+            }
+
+            // 连接成功后，等待断开后再重连
+            break;
+        }
+
+        Ok(())
+    }
+
+    /// 内部连接方法（不包含重连逻辑）
+    async fn connect_websocket_internal(self: Arc<Self>) -> Result<(), String> {
+        // 从HTTP URL构建WebSocket URL
+        // 例如：https://ktv.starfreedomx.top -> wss://ktv.starfreedomx.top
+        let ws_protocol = if self.url.starts_with("https://") {
+            "wss:"
+        } else {
+            "ws:"
+        };
+
+        // 提取主机部分（去除协议）
+        let host_part = if self.url.starts_with("http://") {
+            &self.url[7..] // 跳过 "http://"
+        } else if self.url.starts_with("https://") {
+            &self.url[8..] // 跳过 "https://"
+        } else {
+            &self.url
+        };
+
+        let ws_url = format!(
+            "{}//{}/api/ws?roomId={}&nickname={}",
+            ws_protocol,
+            host_part,
+            self.room_id,
+            urlencoding::encode(&self.nickname)
         );
 
-        debug!("正在获取播放列表: {}", url);
+        info!("正在连接到WebSocket: {}", ws_url);
 
         let resp = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("发送请求失败: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("请求失败，状态码: {}", resp.status()));
-        }
+            .map_err(|e| format!("WebSocket连接失败: {}", e))?;
 
-        let resp_json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("解析JSON失败: {}", e))?;
-        let changed: bool = resp_json["changed"].as_bool().unwrap_or(false);
+        info!("WebSocket连接成功，获取初始歌曲状态...");
 
-        if !changed {
-            debug!("播放列表未改变，跳过更新");
-            return Ok(self.song_playing.lock().await.clone());
-        }
+        // 获取初始歌曲状态（如果有歌曲正在播放，立即投屏）
+        self.fetch_initial_state().await;
 
-        // 获取新的 hash 值
-        let new_hash = resp_json["hash"]
-            .as_str()
-            .unwrap_or("EMPTY_LIST_HASH")
-            .to_string();
+        info!("开始监听消息...");
 
         let extract_bv_function = |url: &str| {
             // 提取 bilibili://video/ 后面的部分
@@ -387,10 +417,59 @@ impl PlaylistManager {
                     }
                 }
             }
-        });
+        }
+
+        // 更新hash值
+        let mut hash_guard = self.hash.lock().await;
+        *hash_guard = Some(new_hash);
     }
 
-    pub async fn next_song(&mut self) -> Result<(), String> {
+    /// 根据hash获取当前播放的歌曲（通过HTTP接口）
+    async fn fetch_current_song_from_hash(&self, hash: &str) -> Result<Option<String>, String> {
+        let url = format!(
+            "{}/api/songListInfo?roomId={}&lastHash={}",
+            self.url, self.room_id, hash
+        );
+
+        debug!("获取当前歌曲: {}", url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("发送请求失败: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("请求失败，状态码: {}", resp.status()));
+        }
+
+        let resp_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析JSON失败: {}", e))?;
+
+        if !resp_json["changed"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+
+        // 提取正在演唱的歌曲
+        let sung_url: Option<String> =
+            if let Some(singing_obj) = resp_json["list"]["singing"].as_object() {
+                singing_obj
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(extract_bv_id)
+            } else {
+                info!("没有正在演唱的歌曲");
+                None
+            };
+
+        Ok(sung_url)
+    }
+
+    /// 请求下一首歌曲（HTTP接口）
+    pub async fn next_song(&self) -> Result<(), String> {
         let url = format!("{}/api/nextSong?roomId={}", self.url, self.room_id);
         let temp_hash = self
             .hash
@@ -405,6 +484,7 @@ impl PlaylistManager {
             .send()
             .await
             .map_err(|e| format!("发送请求失败: {}", e))?;
+
         let resp_json: serde_json::Value = resp
             .json()
             .await
@@ -413,11 +493,12 @@ impl PlaylistManager {
         if !resp_json["success"].as_bool().unwrap_or(false) {
             return Err(format!("请求失败: {}", resp_json));
         }
-        self.fetch_playlist().await?;
 
+        info!("成功请求下一首歌曲");
         Ok(())
     }
 
+    /// 获取当前播放的歌曲
     pub async fn get_song_playing(&self) -> Option<String> {
         self.song_playing.lock().await.clone()
     }
@@ -427,13 +508,14 @@ impl PlaylistManager {
     }
 }
 
-#[tokio::test]
-async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== PlaylistManager 使用示例 ===");
+    /// 获取当前hash
+    pub async fn get_hash(&self) -> Option<String> {
+        self.hash.lock().await.clone()
+    }
 
     let mut manager = PlaylistManager::new("https://ktv.starfreedomx.top", "1111".to_string());
 
-    println!("开始获取播放列表...");
+        debug!("正在获取播放列表: {}", url);
 
     // --- 第一次操作 ---
     match manager.fetch_playlist().await {
@@ -448,33 +530,12 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Err(e) => error!("✗ 获取播放列表失败: {}", e),
-    }
 
-    // --- 第二次操作 ---
-    manager.next_song().await?;
-    println!("请求下一首歌曲后播放列表状态:");
-
-    // 获取当前播放的歌曲
-    {
-        let song_playing = manager.get_song_playing().await;
-        match &song_playing {
-            Some(url) => println!("当前播放的歌曲: {}", url),
-            None => println!("当前没有播放的歌曲"),
-        }
-    }
-
-    // --- 后台任务开始 ---
-    manager.start_periodic_update(|url: String| {
-        println!("Song singing changed to {}!", url);
-        Box::pin(async {})
-    });
-
-    // 【关键点 3】：sleep 必须在“裸奔”状态下运行（不持有任何锁）
-    // 此时 playlist 锁是空闲的，后台线程的 fetch_playlist 才能拿到锁并更新数据
-    sleep(Duration::from_secs(5)).await;
-
-    println!("5秒后播放列表状态:");
+        let resp_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析JSON失败: {}", e))?;
+        let changed: bool = resp_json["changed"].as_bool().unwrap_or(false);
 
     // 获取当前播放的歌曲
     {
@@ -485,6 +546,40 @@ async fn test_playlist_manager() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("=== 示例结束 ===");
-    Ok(())
+        // 获取新的 hash 值
+        let new_hash = resp_json["hash"]
+            .as_str()
+            .unwrap_or("EMPTY_LIST_HASH")
+            .to_string();
+
+        // 从 list 对象中提取 sung 数组的最后一项作为当前播放的歌曲
+        let sung_url: Option<String> = if let Some(list_obj) = resp_json["list"].as_object() {
+            if let Some(sung_array) = list_obj.get("sung").and_then(|s| s.as_array()) {
+                sung_array
+                    .last()
+                    .and_then(|item| item["url"].as_str())
+                    .map(extract_bv_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 更新当前歌曲
+        let mut song_playing = self.song_playing.lock().await;
+        *song_playing = sung_url.clone();
+        drop(song_playing);
+
+    // 获取当前播放的歌曲
+    {
+        let song_playing = manager.get_song_playing().await;
+        match &song_playing {
+            Some(url) => println!("当前播放的歌曲: {}", url),
+            None => println!("当前没有播放的歌曲"),
+        }
+    }
+
+        Ok(sung_url)
+    }
 }
